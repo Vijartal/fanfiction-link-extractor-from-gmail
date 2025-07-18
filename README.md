@@ -37,5 +37,14 @@ with either some manual post processing or the chrome extension
 
 <ins>1.3 - **currently experimental version**</ins> added extension and changes to script work with it
 
+# currently working on
+1 - testing the extension and the script modified for it. - will probably wait on my backlog of things to backup to build up a bit again.
+
+# - roadmap ideas
+1 - set it so the google drive files are created in a folder for neatness
+2 - learn more about how google scripts work with chrome extensions and add a password if the API is stuck public
+3 - look into fanficfare CLI - may not work with fanficfare using browser cache for fanfiction.net - though may work with flaresolverr if its current working
+# credits/etc
+
 ##### code primarily made with chat-gpt due to lack of familiarity with the syntax this type of code and being a general amateur at coding beyond things like IF/AND/OR statements
 
