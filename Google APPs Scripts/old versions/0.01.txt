@@ -1,0 +1,80 @@
+/*
+ * Google Apps Script: Extract FanFiction.net Story Links from Gmail and Label Threads
+ *
+ * This script searches for Gmail threads with a specific label, extracts all FanFiction.net story links,
+ * logs them (or processes them as needed), and then tags each thread with a 'Processed' label.
+ *
+ * To set up:
+ * 1. Create two Gmail labels: one for incoming/unprocessed emails (e.g. 'FFN-Unprocessed')
+ *    and one for processed emails (e.g. 'FFN-Processed').
+ * 2. In the script below, set `SOURCE_LABEL_NAME` and `PROCESSED_LABEL_NAME` to your label names.
+ * 3. (Optional) If you want to store links in a Google Sheet, uncomment and configure the spreadsheet section.
+ * 4. Use Edit > Current project's triggers to run `extractFanfictionLinks` on a time-driven trigger.
+ */
+
+const SOURCE_LABEL_NAME = 'fanfics';
+const PROCESSED_LABEL_NAME = 'temp';
+// Optional: set your Spreadsheet ID and sheet name to store results
+// const SPREADSHEET_ID = 'YOUR_SPREADSHEET_ID';
+// const SHEET_NAME = 'Sheet1';
+
+function extractFanfictionLinks() {
+  // Get or create labels
+  const sourceLabel = GmailApp.getUserLabelByName(SOURCE_LABEL_NAME) || GmailApp.createLabel(SOURCE_LABEL_NAME);
+  const processedLabel = GmailApp.getUserLabelByName(PROCESSED_LABEL_NAME) || GmailApp.createLabel(PROCESSED_LABEL_NAME);
+
+  // Fetch all threads tagged with the source label
+  const threads = sourceLabel.getThreads();
+  if (threads.length === 0) {
+    Logger.log('No threads found with label: ' + SOURCE_LABEL_NAME);
+    return;
+  }
+
+  // Regex to match FanFiction.net story links
+  const linkRegex = /https?:\/\/(?:www\.)?fanfiction\.net\/s\/(\d{1,8})(?:\/\d+)?(?:\/[^\/\s]+)?/gi;
+  const results = [];
+
+  threads.forEach(thread => {
+    let threadLinks = [];
+    const messages = thread.getMessages();
+
+    messages.forEach(msg => {
+      const body = msg.getBody();
+      let match;
+      while ((match = linkRegex.exec(body)) !== null) {
+        // match[0] is full URL, match[1] is the story ID
+        threadLinks.push({ url: match[0], storyId: match[1] });
+      }
+    });
+
+    if (threadLinks.length > 0) {
+      // Process or log the extracted links
+      threadLinks.forEach(linkObj => {
+        Logger.log(`Story ID: ${linkObj.storyId} - URL: ${linkObj.url}`);
+        // Optional: save to Google Sheet
+        // saveToSheet(linkObj.storyId, linkObj.url, thread.getFirstMessageSubject());
+      });
+
+      // Mark thread as processed
+      thread.addLabel(processedLabel);
+      // Optional: remove the source label
+      // thread.removeLabel(sourceLabel);
+
+      results.push({
+        threadId: thread.getId(),
+        links: threadLinks
+      });
+    } else {
+      Logger.log('No FanFiction.net links found in thread: ' + thread.getId());
+    }
+  });
+
+  Logger.log('Extraction complete. Processed ' + results.length + ' threads.');
+}
+
+// Optional helper: Save each link to a Google Sheet
+function saveToSheet(storyId, url, subject) {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(SHEET_NAME) || ss.getSheets()[0];
+  sheet.appendRow([new Date(), storyId, url, subject]);
+}

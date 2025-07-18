@@ -1,0 +1,86 @@
+/*
+ * Google Apps Script: Extract FanFiction.net Story Links from Gmail and Label Threads
+ * Stores extracted links in a Drive text file called "FF links extracted from gmail.txt" and labels threads as processed.
+ * Deduplicates based on story ID by checking against existing entries in the file.
+ * Only labels threads that actually contain new links, leaving others untouched.
+ *
+ * Setup:
+ * 1. Create two Gmail labels: one for incoming/unprocessed emails (e.g. 'FFN-Unprocessed')
+ *    and one for processed emails (e.g. 'FFN-Processed').
+ * 2. Deploy this script in script.google.com and grant Gmail and Drive permissions.
+ * 3. Use Edit > Current project's triggers to run `extractFanfictionLinks` on a time-driven schedule.
+ */
+
+const SOURCE_LABEL_NAME = 'to-extract';
+const PROCESSED_LABEL_NAME = 'link-extracted';
+const DRIVE_FILENAME = 'FF links extracted from gmail.txt';
+
+function extractFanfictionLinks() {
+  // Ensure labels exist
+  const sourceLabel = GmailApp.getUserLabelByName(SOURCE_LABEL_NAME) || GmailApp.createLabel(SOURCE_LABEL_NAME);
+  const processedLabel = GmailApp.getUserLabelByName(PROCESSED_LABEL_NAME) || GmailApp.createLabel(PROCESSED_LABEL_NAME);
+
+  // Prepare Drive file (create if missing)
+  let fileIterator = DriveApp.getFilesByName(DRIVE_FILENAME);
+  let file = fileIterator.hasNext() ? fileIterator.next() : DriveApp.createFile(DRIVE_FILENAME, '');
+  let existingContent = file.getBlob().getDataAsString();
+
+  // Build a set of already extracted story IDs
+  const existingIds = new Set();
+  existingContent.split('\n').forEach(line => {
+    const parts = line.split('|').map(s => s.trim());
+    if (parts[0] && /^\d+$/.test(parts[0])) {
+      existingIds.add(parts[0]);
+    }
+  });
+
+  let newContent = '';
+  let linksAddedTotal = 0;
+  let threadsProcessed = 0;
+
+  // Regex to match FanFiction.net story links
+  const linkRegex = /https?:\/\/(?:www\.)?fanfiction\.net\/s\/(\d{1,8})(?:\/\d+)?(?:\/[^\/\s"'<>]+)?/gi;
+
+  // Fetch threads tagged with the source label
+  const threads = sourceLabel.getThreads();
+
+  threads.forEach(thread => {
+    let threadHasNew = false;
+    let linksInThread = 0;
+
+    thread.getMessages().forEach(msg => {
+      let body = msg.getBody();
+      let match;
+      while ((match = linkRegex.exec(body)) !== null) {
+        const storyId = match[1];
+        const url = match[0].replace(/["'<>]+$/, '');
+        if (!existingIds.has(storyId)) {
+          newContent += Utilities.formatString('%s  |  %s\n', storyId, url);
+          existingIds.add(storyId);
+          linksInThread++;
+        }
+      }
+    });
+
+    if (linksInThread > 0) {
+      // Only label and remove source label if the thread contained new links
+      thread.addLabel(processedLabel);
+      thread.removeLabel(sourceLabel);
+      threadsProcessed++;
+      linksAddedTotal += linksInThread;
+      Logger.log(`Thread ${thread.getId()} had ${linksInThread} new link(s), labeled as processed.`);
+    } else {
+      Logger.log(`Thread ${thread.getId()} had no new links; no labels changed.`);
+    }
+  });
+
+  // Append new links to the Drive file
+  if (linksAddedTotal > 0) {
+    file.setContent(existingContent + newContent);
+    Logger.log(`Appended ${linksAddedTotal} new link(s) to ${DRIVE_FILENAME}.`);
+  } else {
+    Logger.log('No new unique story IDs found to append.');
+  }
+
+  Logger.log(`Extraction complete. Processed ${threadsProcessed} thread(s).`);
+}
