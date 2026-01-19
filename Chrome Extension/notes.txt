@@ -1,0 +1,26 @@
+
+
+
+to do -
+-----
+add delays to settings - done working
+
+add current links to progress window - implemented but not working fully "might work for one link as it shows up initially
+
+add buttons to trigger app script normally
+add a button to trigger a sub-script "to be added" that clears the link files in the drive
+
+-------
+todo for script -
+-----
+fix the doget function
+
+add sub scripts if needed for the above listed buttons for the extension.
+
+add post processing to sb/sv/qq links if needed
+
+cleanup link handling if needed
+
+
+
+"for future when i have static ip maybe restrict to whitelisted IP if possible. 

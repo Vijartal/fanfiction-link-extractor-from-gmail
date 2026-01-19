@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Fanfic Link Resolver",
+  "version": "2.1",
+  "description": "Fetch SV/SB/QQ links, open them in a dedicated popup, track load status, and POST resolved URLs back. Includes debug mode.",
+  "permissions": [
+    "tabs",
+    "storage",
+    "alarms",
+    "windows"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Resolve Fanfic Links",
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html",
+  "web_accessible_resources": [
+    {
+      "resources": ["progress.html","progress.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

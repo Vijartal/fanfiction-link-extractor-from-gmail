@@ -1,0 +1,15 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Link Resolver — Control</title>
+<style>body{font-family:Arial;padding:10px;width:340px}button{padding:6px 10px;margin-right:6px}#status{font-weight:bold}#log{height:120px;overflow:auto;background:#f6f6f6;padding:6px;border:1px solid #ddd;font-family:monospace;font-size:12px}</style>
+</head><body>
+<div id="status">Status: ...</div>
+<div style="margin:8px 0">
+  <button id="start">Start Resolve</button>
+  <button id="abort">Abort</button>
+  <button id="refresh">Refresh</button>
+  <button id="options">Options</button>
+</div>
+<div id="progress" class="small">Resolved: 0 / 0</div>
+<div id="message" style="margin-top:8px"></div>
+<div id="debugContainer" style="display:none;margin-top:8px"><div class="small">Debug log:</div><pre id="log"></pre></div>
+<script src="popup.js"></script>
+</body></html>

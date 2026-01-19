@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Link Resolver — Options</title>
+<style>
+  body { font-family: Arial, sans-serif; padding: 12px; max-width: 700px; }
+  label { display:block; margin-top:8px; font-weight:600; }
+  input[type=text], input[type=number] { width:100%; padding:6px; margin-top:4px; box-sizing:border-box; }
+  button { margin-top:10px; padding:6px 12px; }
+  .note { font-size:12px; color:#444; margin-top:6px; }
+</style>
+</head>
+<body>
+  <h2>Options</h2>
+  <label>File Fetch URL
+    <input id="fileUrl" type="text" placeholder="https://.../SV_SB_QQ_links.txt">
+  </label>
+  <label>Post-back URL
+    <input id="postUrl" type="text" placeholder="https://script.google.com/macros/s/.../exec">
+  </label>
+  <label>Initial delay (minutes)
+    <input id="delay" type="number" min="0" step="1">
+  </label>
+  <label>Max concurrent tabs
+    <input id="maxConcurrent" type="number" min="1" step="1" placeholder="3">
+  </label>
+  <label>Auth token (optional)
+    <input id="token" type="text" placeholder="Optional: token to send as Authorization header">
+  </label>
+  <label>
+    <input id="debug" type="checkbox"> Enable debug mode (writes logs to console and popup)
+  </label>
+  <div class="note">If you set an auth token it will be included in POST requests as Authorization: Bearer &lt;token&gt;.</div>
+  <button id="save">Save</button>
+  <button id="reset">Reset to defaults</button>
+  <div id="status" class="note"></div>
+
+  <script src="options.js"></script>
+</body>
+</html>

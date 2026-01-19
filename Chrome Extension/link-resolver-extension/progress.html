@@ -1,0 +1,21 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Progress</title>
+<style>
+  body{font-family:Arial;padding:12px;width:420px}
+  #status{font-weight:bold;margin-bottom:8px}
+  .small{font-size:13px;color:#333;margin-bottom:8px}
+  button{padding:6px 10px}
+  #currentLinks{font-family:monospace;word-break:break-all;background:#f6f6f6;padding:6px;border:1px solid #ddd;margin-top:6px}
+  .current-item{padding:4px 2px;border-bottom:1px dashed #eee;cursor:pointer}
+  .current-item:last-child{border-bottom:none}
+  .current-item:hover{background:#fff}
+</style>
+</head><body>
+  <div id="status">Initializing…</div>
+  <div class="small" id="progress">Resolved: 0 / 0</div>
+  <div><strong>Current link(s):</strong>
+    <div id="currentLinks">—</div>
+  </div>
+  <div style="margin-top:8px"><button id="abort">Abort</button></div>
+  <div id="details" class="small" style="margin-top:8px"></div>
+  <script src="progress.js"></script>
+</body></html>
