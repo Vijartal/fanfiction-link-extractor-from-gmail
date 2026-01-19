@@ -1,0 +1,293 @@
+// test_harness_final.gs
+// Paste into Apps Script. Run runUserProvidedTest() after replacing the sample arrays
+// with your actual file contents (main file lines and sv file lines).
+
+/** Normalizers & canonical helpers (same rules used by post-process) **/
+function normalizeUrlForKey(u) {
+  if (!u) return '';
+  const tmp = (u || '').trim();
+  const noHash = tmp.split('#')[0];
+  return noHash.replace(/\/+$/, '');
+}
+
+/**
+ * parseResolvedToCanonical(raw)
+ * Try to extract { source: 'SB'|'SV'|'QQ', id: '12345', canonical: '<canonical url>' }
+ * Returns null if it can't parse.
+ */
+function parseResolvedToCanonical(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const u = raw.trim();
+  let source = null;
+  if (/forums\.spacebattles\.com/i.test(u)) source = 'SB';
+  else if (/forums\.sufficientvelocity\.com/i.test(u)) source = 'SV';
+  else if (/forum\.questionablequesting\.com/i.test(u)) source = 'QQ';
+  else return null;
+
+  // Try to find thread slug (may contain .<id> or have slash id)
+  let m = u.match(/\/threads\/([^\/\s'"]+?)(?:[\/#?]|$)/i);
+  if (m && m[1]) {
+    const slugPart = m[1];
+    // if slug contains .<id> at end
+    const dotMatch = slugPart.match(/(?:^|\.)(\d{3,12})$/);
+    if (dotMatch && dotMatch[1]) {
+      const id = dotMatch[1];
+      const hostMatch = u.match(/^(https?:\/\/[^\/]+)\/threads\//i);
+      const base = hostMatch ? hostMatch[1] : ('https://' + u.split('/')[2]);
+      const canonical = `${base}/threads/${slugPart.replace(/\.\d+$/,'')}.${id}/`;
+      return { source, id: String(id), canonical };
+    }
+    // slash-style id after slug
+    const slashIdMatch = u.match(/\/threads\/[^\/\s'"]+\/(\d{3,12})(?:[\/#?]|$)/i);
+    if (slashIdMatch && slashIdMatch[1]) {
+      const id = slashIdMatch[1];
+      const hostMatch = u.match(/^(https?:\/\/[^\/]+)\/threads\//i);
+      const base = hostMatch ? hostMatch[1] : ('https://' + u.split('/')[2]);
+      const canonical = `${base}/threads/${slugPart}.${id}/`;
+      return { source, id: String(id), canonical };
+    }
+  }
+
+  // direct posts /posts/<id>/
+  m = u.match(/\/posts\/(\d{3,12})(?:\/|$)/i);
+  if (m && m[1]) {
+    const id = m[1];
+    const hostMatch = u.match(/^(https?:\/\/[^\/]+)\//i);
+    const base = hostMatch ? hostMatch[1] : ('https://' + u.split('/')[2]);
+    const canonical = `${base}/posts/${id}/`;
+    return { source, id: String(id), canonical };
+  }
+
+  // fallback: try to find any 5-12 digit and make a canonical posts form
+  const fallback = u.match(/(\d{5,12})/);
+  if (fallback && fallback[1]) {
+    const id = fallback[1];
+    const hostMatch = u.match(/^(https?:\/\/[^\/]+)\/threads\//i) || u.match(/^(https?:\/\/[^\/]+)\//i);
+    const base = hostMatch ? hostMatch[1] : ('https://' + u.split('/')[2]);
+    if (/\/posts\//i.test(u)) {
+      return { source, id: String(id), canonical: `${base}/posts/${id}/` };
+    } else {
+      return { source, id: String(id), canonical: `${base}/threads/.${id}/` };
+    }
+  }
+
+  return null;
+}
+
+function mainCanonicalKeyForLineOrItem(src, id, url) {
+  const s = (src || '').toUpperCase();
+  if (id && String(id).trim()) return `${s}-${String(id).trim()}`;
+  return `${s}-${normalizeUrlForKey(url)}`;
+}
+
+/**
+ * buildKeyMapFromTexts(mainText, svText)
+ * returns Map canonicalKey -> { source, occurrences: [lines...] }
+ */
+function buildKeyMapFromTexts(mainText, svText) {
+  const keyMap = new Map();
+  const topEntryRegex = /^\s*([A-Z0-9]{2,5})\s*\|\s*([^\|]+?)\s*\|\s*(\S.*)$/i;
+  const urlRx = /https?:\/\/[^\s'"]+/ig;
+
+  function addOccurrence(key, src, line) {
+    if (!key) return;
+    key = String(key);
+    if (!keyMap.has(key)) keyMap.set(key, { source: (src || key.split('-')[0]).toUpperCase(), occurrences: [] });
+    keyMap.get(key).occurrences.push(line || '');
+  }
+
+  // parse main text lines
+  const mainLines = String(mainText || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  for (const ln of mainLines) {
+    const mt = ln.match(topEntryRegex);
+    if (mt) {
+      const src = String(mt[1]).toUpperCase();
+      const id = String(mt[2] || '').trim();
+      const link = String(mt[3] || '').trim();
+      const key = id ? `${src}-${id}` : `${src}-${normalizeUrlForKey(link)}`;
+      addOccurrence(key, src, ln);
+      continue;
+    }
+    // find any urls (RESOLVED raw lines or other lines)
+    let m;
+    while ((m = urlRx.exec(ln)) !== null) {
+      const url = m[0];
+      let parsed = null;
+      try { parsed = parseResolvedToCanonical(url); } catch (e) { parsed = null; }
+      if (parsed && parsed.source) {
+        const key = parsed.id ? `${parsed.source}-${parsed.id}` : `${parsed.source}-${(parsed.canonical || url).replace(/\/+$/,'')}`;
+        addOccurrence(key, parsed.source, ln);
+      } else {
+        let srcGuess = 'RAW';
+        if (/forums\.spacebattles\.com/i.test(url)) srcGuess = 'SB';
+        else if (/forums\.sufficientvelocity\.com/i.test(url)) srcGuess = 'SV';
+        else if (/forum\.questionablequesting\.com/i.test(url)) srcGuess = 'QQ';
+        addOccurrence(`${srcGuess}-${normalizeUrlForKey(url)}`, srcGuess, ln);
+      }
+    }
+  }
+
+  // include svText lines
+  const svLines = String(svText || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  for (const sline of svLines) {
+    if (!sline) continue;
+    let parsed = null;
+    try { parsed = parseResolvedToCanonical(sline); } catch (e) { parsed = null; }
+    if (parsed && parsed.source) {
+      const key = parsed.id ? `${parsed.source}-${parsed.id}` : `${parsed.source}-${(parsed.canonical || sline).replace(/\/+$/,'')}`;
+      addOccurrence(key, parsed.source, sline);
+    } else {
+      let srcGuess = 'SB';
+      if (/sufficientvelocity/i.test(sline)) srcGuess = 'SV';
+      else if (/questionablequesting/i.test(sline)) srcGuess = 'QQ';
+      addOccurrence(`${srcGuess}-${normalizeUrlForKey(sline)}`, srcGuess, sline);
+    }
+  }
+
+  return keyMap;
+}
+
+/**
+ * computeCountsFromKeyMap(keyMap)
+ * returns { occurrenceCounts, uniqueKeyCounts, dupOccurrenceCounts, duplicateKeyDetails }
+ */
+function computeCountsFromKeyMap(keyMap) {
+  const occurrenceCounts = {};
+  const uniqueKeyCounts = {};
+  const dupOccurrenceCounts = {};
+  const duplicateKeyDetails = {};
+
+  for (const [key, info] of keyMap.entries()) {
+    const src = (info.source || key.split('-')[0]).toUpperCase();
+    const occ = (info.occurrences && info.occurrences.length) || 0;
+    occurrenceCounts[src] = (occurrenceCounts[src] || 0) + occ;
+    uniqueKeyCounts[src] = (uniqueKeyCounts[src] || 0) + 1;
+    if (occ > 1) {
+      dupOccurrenceCounts[src] = (dupOccurrenceCounts[src] || 0) + (occ - 1);
+      duplicateKeyDetails[src] = duplicateKeyDetails[src] || {};
+      duplicateKeyDetails[src][key] = occ;
+    }
+  }
+
+  // ensure forum keys exist so logs are stable
+  ['SV','SB','QQ'].forEach(s => {
+    occurrenceCounts[s] = occurrenceCounts[s] || 0;
+    uniqueKeyCounts[s] = uniqueKeyCounts[s] || 0;
+    dupOccurrenceCounts[s] = dupOccurrenceCounts[s] || 0;
+  });
+
+  return { occurrenceCounts, uniqueKeyCounts, dupOccurrenceCounts, duplicateKeyDetails };
+}
+
+/**
+ * runUserProvidedTest()
+ * Paste your actual file contents into sampleMainLines and sampleSVLines (arrays of lines).
+ * Then run this function. The execution log will contain counts and duplicate details.
+ */
+function runUserProvidedTest() {
+  // ---- PASTE YOUR ACTUAL LINES HERE (replace the examples) ----
+  const sampleMainLines = [
+    // paste each line from your main Drive file here as strings
+    // e.g. "AO3 | 68218391 | http://archiveofourown.org/works/68218391",
+    // ... (use your full actual main file contents)
+  ];
+
+  const sampleSVLines = [
+    // paste each line from your SV_SB_QQ file here as strings
+    // e.g. "https://forums.spacebattles.com/posts/114427238/",
+    // ... (use your full actual sv file contents)
+  ];
+  // ---- end paste zone ----
+
+  const mainText = sampleMainLines.join('\n');
+  const svText = sampleSVLines.join('\n');
+
+  const keyMap = buildKeyMapFromTexts(mainText, svText);
+  const counts = computeCountsFromKeyMap(keyMap);
+
+  Logger.log('--- USER PROVIDED TEST REPORT ---');
+  Logger.log('Total canonical keys found: ' + keyMap.size);
+  Logger.log('OccurrenceCounts (raw lines): ' + JSON.stringify(counts.occurrenceCounts));
+  Logger.log('UniqueKeyCounts (canonical unique keys): ' + JSON.stringify(counts.uniqueKeyCounts));
+  Logger.log('Duplicate occurrence totals (occ - unique): ' + JSON.stringify(counts.dupOccurrenceCounts));
+
+  if (Object.keys(counts.duplicateKeyDetails).length) {
+    Logger.log('----- DUPLICATE DETAILS (keys with >1 occurrence) -----');
+    for (const src of Object.keys(counts.duplicateKeyDetails).sort()) {
+      const map = counts.duplicateKeyDetails[src];
+      const examples = Object.keys(map).slice(0,6).join(', ');
+      const buckets = {};
+      for (const k of Object.keys(map)) {
+        buckets[map[k]] = (buckets[map[k]] || 0) + 1;
+      }
+      const parts = Object.keys(buckets).map(n => `${buckets[n]} key(s) x ${n}`).join(', ');
+      Logger.log(`${src}: ${parts}  (examples: ${examples})`);
+    }
+  } else {
+    Logger.log('No duplicate keys found.');
+  }
+
+  Logger.log('--- END USER PROVIDED TEST REPORT ---');
+  return counts;
+}
+
+/**
+ * Quick demo using your sample block (no leading spaces).
+ * Run runQuickDemoFromYourSample() for a quick check.
+ */
+function runQuickDemoFromYourSample() {
+  const sampleMain = `AO3 | 68218391 | http://archiveofourown.org/works/68218391
+AO3 | 68597076 | http://archiveofourown.org/works/68597076
+AO3 | 68715161 | http://archiveofourown.org/works/68715161
+AO3 | 68952016 | http://archiveofourown.org/works/68952016
+AO3 | 69303651 | http://archiveofourown.org/works/69303651
+AO3 | 68715161 | http://archiveofourown.org/works/68715161
+AO3 | 68952016 | http://archiveofourown.org/works/68952016
+AO3 | 69303651 | http://archiveofourown.org/works/69303651
+AO3 | 68952016 | http://archiveofourown.org/works/68952016
+AO3 | 69303651 | http://archiveofourown.org/works/69303651
+FF | 10752206 | https://www.fanfiction.net/s/10752206/107/Beyond-the-Outer-Gates-Lies-A-high-school-library
+FF | 10852897 | https://www.fanfiction.net/s/10852897/84/Young-Justice-The-Hunter
+FF | 10917272 | https://www.fanfiction.net/s/10917272/75/Under-a-Watchful-Eye
+FF | 10973601 | https://www.fanfiction.net/s/10973601/31/Campione-of-the-Raging-Tides
+FF | 10988329 | https://www.fanfiction.net/s/10988329/12/The-Sage-at-the-Monster-Academy
+FF | 11467696 | https://www.fanfiction.net/s/11467696/38/Do-Me-A-Wrong
+FF | 10988329 | https://www.fanfiction.net/s/10988329/12/The-Sage-at-the-Monster-Academy
+FF | 11467696 | https://www.fanfiction.net/s/11467696/38/Do-Me-A-Wrong
+FF | 10988329 | https://www.fanfiction.net/s/10988329/12/The-Sage-at-the-Monster-Academy
+FF | 10988329 | https://www.fanfiction.net/s/10988329/12/The-Sage-at-the-Monster-Academy`;
+  const sampleSV = `https://forums.spacebattles.com/threads/caves-shelter-for-stray-story-snippets.1238555/page-2#post-114016256
+   https://forums.spacebattles.com/threads/cyberpunk-double-edged-sword-2077-edgerunners.1043469/page-64#post-114016169
+   https://forums.spacebattles.com/threads/breath-of-the-wolf.1094357/page-43#post-114012899
+   https://forums.spacebattles.com/threads/oaths-and-glyphs-rwby-x-green-lantern.1247489/#post-113990477
+   https://forums.spacebattles.com/threads/maverick-solutions-crime-doesnt-pay-enough-marvel-si.1066868/page-869#post-113964812
+   https://forums.spacebattles.com/threads/fantasy-and-fun-come-to-life-five-nights-at-freddys-self-insert.1246394/page-4#post-113942855
+   https://forums.spacebattles.com/threads/tooth-nail-matchlock-and-axe-rewritten-a-warcraft-dungeons-and-dragons-crossover.1192124/#post-113886773
+   https://forums.spacebattles.com/threads/dragons-and-swarm-a-worm-yugioh-5ds-crossover.955759/page-52#post-113954897
+   https://forums.spacebattles.com/threads/fantasy-and-fun-come-to-life-five-nights-at-freddys-self-insert.1246394/page-4#post-113942855
+   https://forums.spacebattles.com/threads/tooth-nail-matchlock-and-axe-rewritten-a-warcraft-dungeons-and-dragons-crossover.1192124/#post-113886773
+   https://forums.spacebattles.com/threads/dragons-and-swarm-a-worm-yugioh-5ds-crossover.955759/page-52#post-113954897
+   https://forums.spacebattles.com/threads/fantasy-and-fun-come-to-life-five-nights-at-freddys-self-insert.1246394/page-4#post-113942855
+   https://forums.sufficientvelocity.com/threads/emperor-of-mankind-quest.145823/#post-35819483
+   https://forums.sufficientvelocity.com/threads/brocktons-celestial-forge-worm-jumpchain.70036/page-2070#post-35826722
+   https://forums.sufficientvelocity.com/threads/emperor-of-mankind-quest.145823/#post-35819483
+   https://forums.sufficientvelocity.com/threads/brocktons-celestial-forge-worm-jumpchain.70036/page-2070#post-35826722
+   https://forums.sufficientvelocity.com/threads/robotech-shadow-war.142664/#post-35831702
+   https://forums.sufficientvelocity.com/threads/the-long-night-part-three-bonfire-at-dawn-45k.136055/page-146#post-35828342
+   https://forum.questionablequesting.com/threads/vixens-coc.33910/#post-11021079
+   https://forum.questionablequesting.com/threads/i-enchanter-fairy-tail-gamer-ish.33904/#post-11019504
+   https://forum.questionablequesting.com/threads/i-enchanter-fairy-tail-gamer-ish.33904/#post-11019504`;
+
+  const keyMap = buildKeyMapFromTexts(sampleMain, sampleSV);
+  const counts = computeCountsFromKeyMap(keyMap);
+
+  Logger.log('Quick demo counts: ' + JSON.stringify(counts));
+  return counts;
+}
+
+
+//qq total 3 - QQ dup 1
+//sv total 6 - SV dup 2
+//sb total 12 - SB dup 4 with 2 twice and 1 3 times
+//ff total 10 - ff dup 4 with 1 twice and 1 four times
+//ao3 total 10 - ao3 dup 5 with 1 twice and 1 three times

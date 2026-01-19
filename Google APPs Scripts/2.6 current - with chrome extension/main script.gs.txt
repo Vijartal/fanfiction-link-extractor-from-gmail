@@ -1,0 +1,890 @@
+// main script.gs
+// set google app script property "SHARED_TOKEN" in settings for security "simplest method is just get and run a cmd prompt command to generate a key"
+// === CONFIGURATION ===
+const SOURCE_LABEL_NAME = 'fanfiction to download';
+const PROCESSED_LABEL_NAME = 'fanfiction to download/z link extracted';
+const DRIVE_FILENAME_MAIN     = 'FF links extracted from gmail.txt';
+const DRIVE_FILENAME_SVSBQQ   = 'SV_SB_QQ_links.txt';
+const DEBUG                   = false;  
+const DEBUG_LOG_FILE = "AppScript_Debug_Log.txt";
+let DEBUG_BUFFER = []; // in-memory buffer
+let ORIGINAL_LOG = null; // will hold original Logger.log
+// === BATCH / RUN-TIME CONFIG ===
+const BATCH_SIZE = 200;                // number of threads processed per batch invocation (tune)
+const MAX_RUN_SECONDS = 270;          // quit this run around this many seconds (leave headroom)
+const BATCH_OFFSET_PROP = 'EXTRACT_BATCH_OFFSET';
+const BATCH_TRIGGER_HANDLER = 'runExtractBatch';
+const SNAPSHOT_CACHE_KEY = 'EXTRACT_SNAPSHOT_IDS';
+const SNAPSHOT_TTL_SECONDS = 86400; // 1 day TTL for safety
+
+
+// debug logging - only works if debug = true
+// Buffer a debug message (cheap)
+function debugLog(message) {
+  if (!DEBUG) return;
+  try {
+    DEBUG_BUFFER.push(`[${new Date().toISOString()}] ${String(message)}`);
+  } catch (e) {
+    // keep it cheap and non-throwing
+  }
+}
+
+// Flush buffer to Drive (safe)
+function flushDebugLog() {
+  if (!DEBUG || DEBUG_BUFFER.length === 0) return;
+
+  const runMarker = `\n==== RUN START: ${new Date().toISOString()} ==== \n`;
+  const contentToAppend = runMarker + DEBUG_BUFFER.join("\n") + "\n==== RUN END ====\n";
+
+  try {
+    const file = getOrCreateDebugFile(DEBUG_LOG_FILE);
+
+    // Prefer appendText if available (fast)
+    if (typeof file.appendText === 'function') {
+      file.appendText(contentToAppend);
+    } else {
+      // fallback: read existing content and setContent (less ideal but reliable)
+      try {
+        const existing = file.getBlob().getDataAsString();
+        file.setContent(existing + contentToAppend);
+      } catch (inner) {
+        // fallback to create new file if anything weird happens
+        DriveApp.createFile(DEBUG_LOG_FILE + '.fallback.' + Date.now(), contentToAppend);
+      }
+    }
+  } catch (err) {
+    // Use the original Logger.log (not the wrapped one) so we do NOT re-buffer this error.
+    if (typeof ORIGINAL_LOG === 'function') {
+      try { ORIGINAL_LOG.call(Logger, 'flushDebugLog error: ' + (err && err.stack ? err.stack : err)); } catch(e) {}
+    } else {
+      try { console.error('flushDebugLog error:', err); } catch(e) {}
+    }
+  } finally {
+    // clear buffer always (avoid leaking memory across runs)
+    DEBUG_BUFFER = [];
+  }
+}
+
+// Create/get debug file (separate helper so it can't clash with main getOrCreateDriveFile)
+function getOrCreateDebugFile(filename) {
+  const iter = DriveApp.getFilesByName(filename);
+  return iter.hasNext() ? iter.next() : DriveApp.createFile(filename, '');
+}
+
+// Wrap Logger.log ONCE and preserve original function in ORIGINAL_LOG.
+// This wrapper must run during script startup.
+(function wrapLogger() {
+  try {
+    // preserve original
+    ORIGINAL_LOG = Logger.log && Logger.log.bind(Logger);
+
+    // replace with wrapper that buffers then calls original
+    const orig = ORIGINAL_LOG;
+    Logger.log = function(message) {
+      try { if (DEBUG) debugLog(message); } catch (e) {}
+      // call original logger (may still throw, but that's fine)
+      if (typeof orig === 'function') return orig(message);
+    };
+  } catch (e) {
+    // If wrapping fails, make sure ORIGINAL_LOG isn't null (best effort)
+    try { ORIGINAL_LOG = Logger.log; } catch (ee) {}
+  }
+})();
+
+// === MAIN (updated) ===
+function extractAndStoreFanficLinks() {
+  const allLabels = GmailApp.getUserLabels().map(l => l.getName());
+  if (DEBUG) Logger.log('All labels: ' + JSON.stringify(allLabels));
+
+  const sourceLabel    = GmailApp.getUserLabelByName(SOURCE_LABEL_NAME);
+  const processedLabel = GmailApp.getUserLabelByName(PROCESSED_LABEL_NAME);
+  if (!sourceLabel) {
+    Logger.log(`No source label '${SOURCE_LABEL_NAME}'`);
+    return;
+  }
+
+  const threads = sourceLabel.getThreads();
+  const allLinks = new Map();
+
+  // Collect links from messages
+  threads.forEach(thread => {
+    let threadHasLinks = false;
+    thread.getMessages().forEach(msg => {
+      extractLinks(msg.getBody()).forEach(({ source, id, link }) => {
+        const key = `${source}-${id}`;
+        if (!allLinks.has(key)) {
+          allLinks.set(key, { source, id, link });
+          threadHasLinks = true;
+        }
+      });
+    });
+    if (threadHasLinks) {
+      thread.addLabel(processedLabel);
+      thread.removeLabel(sourceLabel);
+    }
+  });
+
+  // Sorted list of extracted items
+  const sorted = Array.from(allLinks.values()).sort((a,b) => {
+    if (a.source === b.source) return a.id.localeCompare(b.id);
+    return a.source.localeCompare(b.source);
+  });
+
+  // Read existing main file content to discover previously appended RESOLVED lines
+  const mainFile = getOrCreateDriveFile(DRIVE_FILENAME_MAIN);
+  let existingContent = '';
+  try { existingContent = mainFile.getBlob().getDataAsString(); } catch (e) { existingContent = ''; }
+
+  // Parse raw RESOLVED lines (raw strings)
+  const existingResolvedRaw = [];
+  if (existingContent) {
+    const lines = existingContent.split(/\r?\n/);
+    for (const ln of lines) {
+      const m = ln.match(/^\s*RESOLVED\s*\|\s*(\S.*)$/i);
+      if (m && m[1]) existingResolvedRaw.push(m[1].trim());
+    }
+  }
+
+  // Attempt to parse each raw resolved URL into {source,id,link} using existing extractLinks()
+  const parsedResolvedEntries = []; // parsed entries we can reformat into SOURCE|id|link
+  const resolvedKeySet = new Set(); // keys source-id for quick membership test
+  for (const rawUrl of existingResolvedRaw) {
+    const matches = extractLinks(rawUrl); // may return [] if no regex matched
+    if (matches && matches.length) {
+      // Use first match (should be one)
+      const { source, id } = matches[0];
+      const entry = { source, id, link: rawUrl };
+      const key = `${source}-${id}`;
+      if (!resolvedKeySet.has(key)) {
+        parsedResolvedEntries.push(entry);
+        resolvedKeySet.add(key);
+      }
+    } // else: couldn't parse the resolved URL into a known source/id; we keep raw line for audit below
+  }
+
+  // Separate extracted entries into SV/SB/QQ (forum links) and others (AO3, FF, ...)
+  const svsbqq = sorted.filter(o => ['SV','SB','QQ'].includes(o.source));
+  const others = sorted.filter(o => !['SV','SB','QQ'].includes(o.source));
+
+  // Remove from 'svsbqq' any entry that we already have in resolvedKeySet (they are resolved)
+  const unresolvedSvEntries = svsbqq.filter(o => !resolvedKeySet.has(`${o.source}-${o.id}`));
+
+  // Build the top listing:
+  // - include non-forum entries (others)
+  // - include parsedResolvedEntries (so resolved forum posts are shown in the top with other sources)
+  // Avoid duplicates: if a parsedResolved entry matches an entry in 'others' (rare), skip duplication.
+  const topMap = new Map();
+  // add others first
+  for (const o of others) {
+    const k = `${o.source}-${o.id}`;
+    if (!topMap.has(k)) topMap.set(k, { source: o.source, id: o.id, link: o.link });
+  }
+  // add parsed resolved entries (these may be forum posts)
+  for (const r of parsedResolvedEntries) {
+    const k = `${r.source}-${r.id}`;
+    if (!topMap.has(k)) topMap.set(k, { source: r.source, id: r.id, link: r.link });
+  }
+
+  // Convert topMap to sorted array (by source then id)
+  const topEntries = Array.from(topMap.values()).sort((a,b) => {
+    if (a.source === b.source) return a.id.localeCompare(b.id);
+    return a.source.localeCompare(b.source);
+  });
+
+  // Build final main output: top entries formatted, then the SV/SB/QQ summary + unresolved list, then previously RESOLVED raw lines.
+  const topBlock = topEntries.map(o => `${o.source} | ${o.id} | ${o.link}`).join('\n');
+
+  // SV/SB/QQ summary and unresolved list
+  const totalSV = svsbqq.length;
+  const unresolvedCount = unresolvedSvEntries.length;
+  const resolvedCount = totalSV - unresolvedCount;
+
+  const sep = '\n\n----- SV/SB/QQ SUMMARY -----\n';
+  const summaryLines = [
+    `Total SV/SB/QQ links: ${totalSV}`,
+    `Resolved (detected): ${resolvedCount}`,
+    `Unresolved: ${unresolvedCount}`,
+    ''
+  ].join('\n');
+
+  const unresolvedSection = 'Unresolved links:\n' + (unresolvedSvEntries.length ? unresolvedSvEntries.map(sv => sv.link).join('\n') : 'None') + '\n\n';
+
+  const resolvedSectionHeader = 'Previously RESOLVED lines found (raw):\n';
+  const resolvedSection = resolvedSectionHeader + (existingResolvedRaw.length ? existingResolvedRaw.join('\n') : 'None') + '\n';
+
+  const finalMainContent = (topBlock ? (topBlock + '\n') : '') + sep + summaryLines + unresolvedSection + resolvedSection;
+
+  mainFile.setContent(finalMainContent);
+
+  // Build SV/SB/QQ output file used by the extension (unchanged - contains all original SV/SB/QQ links)
+  const svsbqqOutput = sorted
+    .filter(o => ['SV','SB','QQ'].includes(o.source))
+    .map(o => o.link)
+    .join('\n');
+  const svFile = getOrCreateDriveFile(DRIVE_FILENAME_SVSBQQ);
+  svFile.setContent(svsbqqOutput);
+}
+
+// === LINK EXTRACTION ===
+function extractLinks(body) {
+  if (!body || typeof body !== 'string') return [];
+  const results = [];
+
+  // Define patterns as strings so we construct fresh RegExp objects per call.
+  const regexMap = [
+    { source:'FF',  pattern: 'https?:\\/\\/(?:www\\.)?fanfiction\\.net\\/s\\/(\\d{1,8})(?:\\/\\d+)?(?:\\/[\\w\\-\\.%@~:+#?&=]*)?' , flags: 'gi' },
+    { source:'AO3', pattern: 'https?:\\/\\/(?:www\\.)?archiveofourown\\.org\\/works\\/(\\d+)(?:\\/chapters\\/\\d+)?', flags: 'gi' },
+    { source:'SV',  pattern: 'https?:\\/\\/forums\\.sufficientvelocity\\.com\\/posts\\/(\\d{6,9})\\/?', flags: 'gi' },
+    { source:'SB',  pattern: 'https?:\\/\\/forums\\.spacebattles\\.com\\/posts\\/(\\d{6,9})\\/?', flags: 'gi' },
+    { source:'QQ',  pattern: 'https?:\\/\\/forum\\.questionablequesting\\.com\\/posts\\/(\\d{6,9})\\/?', flags: 'gi' }
+  ];
+
+  for (const cfg of regexMap) {
+    // fresh RegExp each call avoids lastIndex issues
+    const regex = new RegExp(cfg.pattern, cfg.flags);
+    let m;
+    while ((m = regex.exec(body)) !== null) {
+      // m[0] is full match, m[1] is captured id
+      results.push({ source: cfg.source, id: String(m[1] || '').trim(), link: m[0] });
+    }
+  }
+  return results;
+}
+
+function runExtractBatch() {
+  // Acquire a lock so two triggers don't run concurrently and corrupt snapshot
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30 * 1000)) {
+    Logger.log('runExtractBatch: could not obtain lock; another runner is active.');
+    return;
+  }
+
+  try {
+    const start = Date.now();
+    const maxMs = (MAX_RUN_SECONDS || 270) * 1000;
+    const marginMs = 2000; // stop a little early
+    const props = PropertiesService.getScriptProperties();
+
+    const sourceLabel = GmailApp.getUserLabelByName(SOURCE_LABEL_NAME);
+    if (!sourceLabel) {
+      Logger.log('runExtractBatch: source label not found: ' + SOURCE_LABEL_NAME);
+      clearBatchStateAndTriggers();
+      _clearSnapshotCache();
+      return;
+    }
+    // Ensure processed label exists
+    let processedLabel = GmailApp.getUserLabelByName(PROCESSED_LABEL_NAME);
+    if (!processedLabel) processedLabel = GmailApp.createLabel(PROCESSED_LABEL_NAME);
+
+    // Get or build snapshot of thread IDs
+    let snapshot = _getSnapshotArrayFromCache();
+    if (!snapshot) {
+      // Build fresh snapshot (IDs only).
+      const threadsNow = sourceLabel.getThreads();
+      snapshot = threadsNow.map(t => t.getId());
+      Logger.log('runExtractBatch: built new snapshot length=' + snapshot.length);
+      _saveSnapshotArrayToCache(snapshot);
+      if (snapshot.length === 0) {
+        Logger.log('runExtractBatch: no threads to process; clearing triggers/state.');
+        clearBatchStateAndTriggers();
+        _clearSnapshotCache();
+        return;
+      }
+    } else {
+      Logger.log('runExtractBatch: loaded snapshot length=' + snapshot.length);
+    }
+
+    // Decide how many to process this invocation
+    const itemsToProcess = Math.min(BATCH_SIZE, snapshot.length);
+    if (itemsToProcess <= 0) {
+      Logger.log('runExtractBatch: nothing to process.');
+      clearBatchStateAndTriggers();
+      _clearSnapshotCache();
+      return;
+    }
+
+    // We'll collect discovered links in this Map and persist at end
+    const allLinks = new Map();
+
+    // Process the first itemsToProcess IDs from the snapshot
+    for (let i = 0; i < itemsToProcess; i++) {
+      // Time guard
+      if (Date.now() - start > (maxMs - marginMs)) {
+        Logger.log('runExtractBatch: near time limit, saving snapshot and scheduling next run.');
+        // Save remaining snapshot back
+        _saveSnapshotArrayToCache(snapshot);
+        scheduleNextBatchIfNeeded();
+        // Persist any collected links so far
+        try { persistCollectedLinks(allLinks); } catch (e) { Logger.log('persistCollectedLinks partial error: ' + e); }
+        flushDebugLog();
+        return;
+      }
+
+      const threadId = snapshot[0]; // always front
+      if (!threadId) {
+        // defensive: pop and continue
+        snapshot.shift();
+        continue;
+      }
+
+      let thread = null;
+      try {
+        thread = GmailApp.getThreadById(threadId);
+      } catch (e) {
+        Logger.log('runExtractBatch: failed to get thread by id ' + threadId + ' - skipping. Err: ' + e);
+        // remove the id from snapshot and continue
+        snapshot.shift();
+        continue;
+      }
+
+      // If thread no longer has the source label (someone else changed it), skip but remove from snapshot
+      try {
+        const threadLabels = thread.getLabels().map(l => l.getName());
+        if (!threadLabels.includes(SOURCE_LABEL_NAME)) {
+          Logger.log('runExtractBatch: thread id ' + threadId + ' no longer has source label; skipping and removing from snapshot.');
+          snapshot.shift();
+          continue;
+        }
+      } catch (e) {
+        Logger.log('runExtractBatch: getLabels() failed for thread ' + threadId + ' : ' + e);
+        // still remove and continue
+        snapshot.shift();
+        continue;
+      }
+
+      // Process messages in thread
+      let threadHasLinks = false;
+      try {
+        const messages = thread.getMessages();
+        for (let m = 0; m < messages.length; m++) {
+          const body = messages[m].getBody ? messages[m].getBody() : '';
+          const found = extractLinks(body);
+          if (found && found.length) {
+            threadHasLinks = true;
+            for (const it of found) {
+              const key = `${it.source}-${it.id || it.link}`;
+              if (!allLinks.has(key)) allLinks.set(key, { source: it.source, id: it.id, link: it.link });
+            }
+          }
+        }
+      } catch (e) {
+        Logger.log('runExtractBatch: error scanning messages for thread ' + threadId + ' : ' + e);
+      }
+
+      // Only label as processed and remove source label if we actually found links
+      if (threadHasLinks) {
+        try {
+          thread.addLabel(processedLabel);
+          thread.removeLabel(sourceLabel);
+          Logger.log('runExtractBatch: thread ' + threadId + ' had links - labeled processed and removed source label.');
+        } catch (e) {
+          Logger.log('runExtractBatch: failed to add/remove labels for thread ' + threadId + ' : ' + e);
+        }
+      } else {
+        Logger.log('runExtractBatch: thread ' + threadId + ' had no links; leaving labels intact.');
+      }
+
+      // Remove this thread ID from snapshot (processed or skipped)
+      snapshot.shift();
+    } // end loop
+
+    // Save updated snapshot back to cache
+    if (snapshot.length > 0) {
+      _saveSnapshotArrayToCache(snapshot);
+      Logger.log('runExtractBatch: saved remaining snapshot length=' + snapshot.length);
+      scheduleNextBatchIfNeeded();
+    } else {
+      Logger.log('runExtractBatch: snapshot exhausted; clearing triggers/state.');
+      _clearSnapshotCache();
+      clearBatchStateAndTriggers();
+    }
+
+    // Persist all discovered links (but do NOT run postProcessMainFile here)
+    try {
+      persistCollectedLinks(allLinks);
+      // IMPORTANT: Removed call to postProcessMainFile() — remote controller will run that via doPost when it has resolved links.
+    } catch (e) {
+      Logger.log('runExtractBatch: error persisting links: ' + e);
+    }
+
+    flushDebugLog();
+  } finally {
+    try { lock.releaseLock(); } catch (e) {}
+  }
+}
+
+// Accumulate per-source email duplicate stats into ScriptProperties (merge with existing)
+function _accumulateEmailDuplicateStats(runUniqueCounts, runDupCounts) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const raw = props.getProperty('EMAIL_DUP_STATS') || '{}';
+    const existing = JSON.parse(raw || '{}');
+
+    existing.unique = existing.unique || {};
+    existing.dup = existing.dup || {};
+
+    for (const k of Object.keys(runUniqueCounts || {})) {
+      existing.unique[k] = (existing.unique[k] || 0) + (runUniqueCounts[k] || 0);
+    }
+    for (const k of Object.keys(runDupCounts || {})) {
+      existing.dup[k] = (existing.dup[k] || 0) + (runDupCounts[k] || 0);
+    }
+
+    props.setProperty('EMAIL_DUP_STATS', JSON.stringify(existing));
+  } catch (e) {
+    Logger.log('_accumulateEmailDuplicateStats error: ' + e);
+  }
+}
+
+// Fetch and clear the accumulated email duplicate stats (returns { unique: {}, dup: {} })
+function _fetchAndClearEmailDuplicateStats() {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const raw = props.getProperty('EMAIL_DUP_STATS') || '{}';
+    const existing = JSON.parse(raw || '{}');
+    props.deleteProperty('EMAIL_DUP_STATS');
+    return { unique: existing.unique || {}, dup: existing.dup || {} };
+  } catch (e) {
+    Logger.log('_fetchAndClearEmailDuplicateStats error: ' + e);
+    return { unique: {}, dup: {} };
+  }
+}
+
+function _getSnapshotArrayFromCache() {
+  const cache = CacheService.getScriptCache();
+  const raw = cache.get(SNAPSHOT_CACHE_KEY);
+  if (!raw) return null;
+  try {
+    const arr = JSON.parse(raw);
+    if (Array.isArray(arr)) return arr;
+  } catch (e) {
+    Logger.log('_getSnapshotArrayFromCache: JSON parse error - clearing snapshot: ' + e);
+    cache.remove(SNAPSHOT_CACHE_KEY);
+  }
+  return null;
+}
+
+function _saveSnapshotArrayToCache(arr) {
+  const cache = CacheService.getScriptCache();
+  try {
+    cache.put(SNAPSHOT_CACHE_KEY, JSON.stringify(arr), SNAPSHOT_TTL_SECONDS);
+  } catch (e) {
+    Logger.log('_saveSnapshotArrayToCache error: ' + e);
+  }
+}
+
+function _clearSnapshotCache() {
+  try { CacheService.getScriptCache().remove(SNAPSHOT_CACHE_KEY); } catch (e) { Logger.log('_clearSnapshotCache error: ' + e); }
+}
+
+/**
+ * Ensure an installable time-based trigger exists for BATCH_TRIGGER_HANDLER.
+ * Creates an every-minute trigger if none exists.
+ */
+function scheduleNextBatchIfNeeded() {
+  try {
+    const handler = BATCH_TRIGGER_HANDLER;
+    // If a trigger for the handler already exists, do nothing
+    const triggers = ScriptApp.getProjectTriggers();
+    for (const t of triggers) {
+      if (t.getHandlerFunction() === handler) {
+        Logger.log('scheduleNextBatchIfNeeded: trigger already exists for ' + handler);
+        return;
+      }
+    }
+
+    // Create a new time-based trigger (every 1 minute) to run the batch worker
+    ScriptApp.newTrigger(handler).timeBased().everyMinutes(1).create();
+    Logger.log('scheduleNextBatchIfNeeded: created time-based trigger for ' + handler);
+  } catch (e) {
+    Logger.log('scheduleNextBatchIfNeeded error: ' + e);
+    throw e;
+  }
+}
+
+// === DRIVE HELPERS ===
+/**
+ * Return an existing Drive file by name or create an empty one.
+ * Safe, minimal implementation used by persistCollectedLinks().
+ */
+function getOrCreateDriveFile(filename) {
+  if (!filename || typeof filename !== 'string') {
+    throw new Error('getOrCreateDriveFile: filename required');
+  }
+  const iter = DriveApp.getFilesByName(filename);
+  if (iter.hasNext()) return iter.next();
+  // create with empty content to ensure consistent behavior
+  return DriveApp.createFile(filename, '');
+}
+
+/**
+ * Remove triggers for the batch handler and clear any related properties.
+ * Safe to call when finishing processing.
+ */
+function clearBatchStateAndTriggers() {
+  try {
+    const handler = BATCH_TRIGGER_HANDLER;
+    const triggers = ScriptApp.getProjectTriggers();
+    for (const t of triggers) {
+      if (t.getHandlerFunction() === handler) {
+        try {
+          ScriptApp.deleteTrigger(t);
+          Logger.log('clearBatchStateAndTriggers: deleted trigger for ' + handler);
+        } catch (delErr) {
+          Logger.log('clearBatchStateAndTriggers: failed to delete trigger: ' + delErr);
+        }
+      }
+    }
+
+    // clear any stored batch offset property (defensive)
+    try { PropertiesService.getScriptProperties().deleteProperty(BATCH_OFFSET_PROP); } catch (e) {}
+    // clear snapshot cache too
+    try { _clearSnapshotCache(); } catch (e) {}
+
+  } catch (e) {
+    Logger.log('clearBatchStateAndTriggers error: ' + e);
+    // don't rethrow — clearing should be best-effort
+  }
+}
+
+/**
+ * Persist a collection of discovered links to Drive files.
+ * Improved duplicate detection: uses canonical keys for counting (SRC-id or forum post/thread id)
+ */
+function persistCollectedLinks(collected) {
+  try {
+    // Normalize input into an array of {source,id,link}
+    const items = [];
+    if (collected instanceof Map) {
+      for (const v of collected.values()) {
+        if (v && v.source && v.link) items.push({ source: String(v.source).toUpperCase(), id: String(v.id || '').trim(), link: String(v.link).trim() });
+      }
+    } else if (Array.isArray(collected)) {
+      for (const v of collected) if (v && v.source && v.link) items.push({ source: String(v.source).toUpperCase(), id: String(v.id || '').trim(), link: String(v.link).trim() });
+    } else if (collected && typeof collected === 'object') {
+      for (const k of Object.keys(collected)) {
+        const v = collected[k];
+        if (v && v.source && v.link) items.push({ source: String(v.source).toUpperCase(), id: String(v.id || '').trim(), link: String(v.link).trim() });
+      }
+    }
+
+    if (!items.length) {
+      Logger.log('persistCollectedLinks: nothing to persist.');
+      return { appendedMain: 0, appendedSV: 0, appendedLines: [] };
+    }
+
+    // ----------------------------
+    // Helpers: canonical key builders
+    // ----------------------------
+    // Normalize a URL for fallback key use (lowercase host, remove trailing slash)
+    function normalizeUrlForKey(u) {
+      if (!u) return '';
+      try {
+        const tmp = u.trim();
+        // don't throw on weird urls; just strip trailing slashes and lower host-ish part
+        const noHash = tmp.split('#')[0];
+        return noHash.replace(/\/+$/,'');
+      } catch (e) {
+        return u.replace(/\/+$/,'');
+      }
+    }
+
+    // Extract forum canonical key from a url: prefer post-id, else thread id, else normalized url
+    function forumCanonicalKey(url) {
+      if (!url) return null;
+      const u = url;
+      // post patterns
+      let m = u.match(/\/posts\/(\d{3,12})(?:\/|$)/i) || u.match(/#post-(\d{3,12})/i) || u.match(/post-(\d{3,12})/i);
+      if (m && m[1]) {
+        const postId = m[1];
+        // detect source
+        let src = null;
+        if (/forums\.spacebattles\.com/i.test(u)) src = 'SB';
+        else if (/forums\.sufficientvelocity\.com/i.test(u)) src = 'SV';
+        else if (/forum\.questionablequesting\.com/i.test(u)) src = 'QQ';
+        if (src) return `${src}-${postId}`;
+      }
+      // thread id patterns (slug.id or /threads/.../<id>/)
+      m = u.match(/\/threads\/([^\/\s'"]+?)(?:[\/#?]|$)/i);
+      if (m && m[1]) {
+        const slug = m[1];
+        const dotMatch = slug.match(/(?:^|\.)(\d{3,12})$/);
+        if (dotMatch && dotMatch[1]) {
+          const threadId = dotMatch[1];
+          let src = null;
+          if (/forums\.spacebattles\.com/i.test(u)) src = 'SB';
+          else if (/forums\.sufficientvelocity\.com/i.test(u)) src = 'SV';
+          else if (/forum\.questionablequesting\.com/i.test(u)) src = 'QQ';
+          if (src) return `${src}-${threadId}`;
+        }
+        const slashId = u.match(/\/threads\/[^\/\s'"]+\/(\d{3,12})(?:[\/#?]|$)/i);
+        if (slashId && slashId[1]) {
+          const threadId = slashId[1];
+          let src = null;
+          if (/forums\.spacebattles\.com/i.test(u)) src = 'SB';
+          else if (/forums\.sufficientvelocity\.com/i.test(u)) src = 'SV';
+          else if (/forum\.questionablequesting\.com/i.test(u)) src = 'QQ';
+          if (src) return `${src}-${threadId}`;
+        }
+      }
+      // fallback
+      const host = (u.match(/https?:\/\/[^\/]+/i) || [''])[0];
+      const srcGuess = /spacebattles/i.test(host) ? 'SB' : (/sufficientvelocity/i.test(host) ? 'SV' : (/questionablequesting/i.test(host) ? 'QQ' : 'FR'));
+      return `${srcGuess}-${normalizeUrlForKey(u)}`;
+    }
+
+    // Extract main file canonical key for existing lines and incoming non-forum items
+    // Prefer SRC-id if id present, else SRC-normalizedUrl
+    function mainCanonicalKeyForLineOrItem(src, id, url) {
+      const s = (src || '').toUpperCase();
+      if (id && String(id).trim()) return `${s}-${String(id).trim()}`;
+      return `${s}-${normalizeUrlForKey(url)}`;
+    }
+
+    // ----------------------------
+    // Load existing files and build key sets for duplicate detection
+    // ----------------------------
+    const mainFile = getOrCreateDriveFile(DRIVE_FILENAME_MAIN);
+    let mainText = '';
+    try { mainText = mainFile.getBlob().getDataAsString(); } catch (e) { mainText = ''; }
+    const existingMainLines = mainText.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+
+    // build a Set of canonical main keys present in existingMainLines
+    const existingMainKeys = new Set();
+    const mainLineRegex = /^\s*([A-Z0-9]{2,5})\s*\|\s*([^\|]+?)\s*\|\s*(\S.*)$/i;
+    for (const ln of existingMainLines) {
+      const m = ln.match(mainLineRegex);
+      if (m) {
+        const src = String(m[1]).toUpperCase().trim();
+        const id = String(m[2] || '').trim();
+        const link = String(m[3] || '').trim();
+        existingMainKeys.add(mainCanonicalKeyForLineOrItem(src, id, link));
+      } else {
+        // Not a "SRC | id | link" line (could be summary etc.) -> skip
+      }
+    }
+
+    // SV file load and existingSVKeys (canonical forum keys)
+    const svFile = getOrCreateDriveFile(DRIVE_FILENAME_SVSBQQ);
+    let svText = '';
+    try { svText = svFile.getBlob().getDataAsString(); } catch (e) { svText = ''; }
+    const existingSVLines = svText.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const existingSVKeys = new Set();
+    for (const ln of existingSVLines) {
+      const key = forumCanonicalKey(ln);
+      if (key) existingSVKeys.add(key);
+    }
+
+    // Prepare groups to append
+    const toAppendMain = [];      // formatted non-forum lines to write
+    const forumToAppendToSV = []; // raw forum links to append
+
+    // Run-time per-source counters for this invocation
+    const runUnique = {}; // source => count (new canonical keys we appended this run)
+    const runDup = {};    // source => count (duplicates detected this run - canonical)
+    // Also track appendedLines for returning
+    const appendedLines = [];
+
+    // Process each discovered item and decide using canonical keys
+    for (const it of items) {
+      if (!it || !it.source || !it.link) continue;
+      const src = String(it.source).toUpperCase();
+      const idSafe = (it.id || '').toString().trim();
+      if (['SV','SB','QQ'].includes(src)) {
+        // forum item canonical key
+        const key = forumCanonicalKey(it.link);
+        if (!existingSVKeys.has(key)) {
+          // append raw line but mark canonical key as present
+          forumToAppendToSV.push(it.link);
+          existingSVKeys.add(key);
+          runUnique[src] = (runUnique[src] || 0) + 1;
+          appendedLines.push(it.link);
+        } else {
+          runDup[src] = (runDup[src] || 0) + 1;
+        }
+      } else {
+        // non-forum: canonical by source-id when possible
+        const key = mainCanonicalKeyForLineOrItem(src, idSafe, it.link);
+        if (!existingMainKeys.has(key)) {
+          const formatted = `${src} | ${idSafe} | ${String(it.link).trim()}`;
+          toAppendMain.push(formatted);
+          existingMainKeys.add(key);
+          runUnique[src] = (runUnique[src] || 0) + 1;
+          appendedLines.push(formatted);
+        } else {
+          runDup[src] = (runDup[src] || 0) + 1;
+        }
+      }
+    }
+
+    // Write out changes (single writes)
+    let appendedMain = 0;
+    let appendedSV = 0;
+    if (toAppendMain.length) {
+      const newMainContent = (mainText && mainText.length ? (mainText + '\n') : '') + toAppendMain.join('\n') + '\n';
+      mainFile.setContent(newMainContent);
+      appendedMain = toAppendMain.length;
+      Logger.log(`persistCollectedLinks: appended ${appendedMain} non-forum lines to ${DRIVE_FILENAME_MAIN}`);
+    } else {
+      Logger.log('persistCollectedLinks: no new non-forum lines to append to main file.');
+    }
+
+    if (forumToAppendToSV.length) {
+      const newSVContent = (svText && svText.length ? (svText + '\n') : '') + forumToAppendToSV.join('\n') + '\n';
+      svFile.setContent(newSVContent);
+      appendedSV = forumToAppendToSV.length;
+      Logger.log(`persistCollectedLinks: appended ${appendedSV} forum links to ${DRIVE_FILENAME_SVSBQQ}`);
+    } else {
+      Logger.log('persistCollectedLinks: no new forum links to append to SV/SB/QQ file.');
+    }
+
+    // Persist run stats to ScriptProperties so postProcessMainFile() can incorporate them.
+    try {
+      _accumulateEmailDuplicateStats(runUnique, runDup);
+      Logger.log('persistCollectedLinks: accumulated runUnique/runDup: ' + JSON.stringify({runUnique, runDup}));
+    } catch (e) {
+      Logger.log('persistCollectedLinks: failed to accumulate stats: ' + e);
+    }
+
+    return { appendedMain, appendedSV, appendedLines };
+  } catch (err) {
+    Logger.log('persistCollectedLinks error: ' + (err && err.stack ? err.stack : err));
+    throw err;
+  }
+}
+
+// === WEB APP ENDPOINTS ===
+// NOTE: this project must include your auth.gs (verifyToken/extractIncomingToken/getExpectedToken).
+
+/**
+ * Protected GET: returns the SV_SB_QQ_links.txt (plain text). Requires token.
+ * The token may be supplied as:
+ *  - Authorization: Bearer <token> (preferred),
+ *  - JSON body { "token": "..." } (for POST only; included for completeness),
+ *  - or ?token=<token> query param.
+ */
+function doGet(e) {
+   try {
+    // verify token
+     if (typeof verifyToken === 'function') {
+       if (!verifyToken(e)) {
+         return ContentService.createTextOutput('Unauthorized').setMimeType(ContentService.MimeType.TEXT);
+       }
+     } else {
+       return ContentService.createTextOutput('Unauthorized').setMimeType(ContentService.MimeType.TEXT);
+     }
+
+     // Return the SV/SB/QQ file content (create empty if missing)
+     const ITER = DriveApp.getFilesByName(DRIVE_FILENAME_SVSBQQ);
+     if (!ITER.hasNext()) {
+       return ContentService.createTextOutput('').setMimeType(ContentService.MimeType.TEXT);
+     }
+
+     const content = ITER.next().getBlob().getDataAsString();
+     return ContentService.createTextOutput(content).setMimeType(ContentService.MimeType.TEXT);
+  
+     } finally {
+       flushDebugLog(); // <-- flush once here
+     }
+}
+
+/**
+ * Protected POST: accepts JSON body {"resolved": ["url1","url2", ...]} and appends to main file.
+ * Requires token (same extraction logic as doGet).
+ */
+/**
+ * Unified doPost that handles:
+ *  - {"action":"run"}      -> triggers extractAndStoreFanficLinks()
+ *  - {"action":"clear"}    -> clears the main and SV/SB/QQ Drive files (empties content)
+ *  - {"resolved":[...]}    -> appends resolved URLs to DRIVE_FILENAME_MAIN (existing behaviour)
+ *
+ * Token is required and verified by verifyToken(e) from auth.gs.
+ */
+function doPost(e) {
+  try {
+    // token check
+    if (typeof verifyToken === 'function') {
+      if (!verifyToken(e)) {
+        return ContentService.createTextOutput('Unauthorized').setMimeType(ContentService.MimeType.TEXT);
+      }
+    } else {
+      return ContentService.createTextOutput('Unauthorized').setMimeType(ContentService.MimeType.TEXT);
+    }
+
+    // parse JSON body if present
+    let body = null;
+    if (e && e.postData && e.postData.contents) {
+      try { body = JSON.parse(e.postData.contents); } catch (err) { body = null; }
+    }
+
+    const actionParam = (e && e.parameter && e.parameter.action) ? String(e.parameter.action).toLowerCase() : null;
+    const action = (body && body.action) ? String(body.action).toLowerCase() : (actionParam || null);
+
+    if (action === 'run') {
+      try {
+        // schedule the batch runner and return immediately (avoid webapp timeout)
+        scheduleNextBatchIfNeeded();
+        return ContentService.createTextOutput('OK: scheduled extractor run (batch mode).').setMimeType(ContentService.MimeType.TEXT);
+      } catch (err) {
+        Logger.log('doPost(schedule run) error: ' + (err && err.stack ? err.stack : err));
+        return ContentService.createTextOutput('Error scheduling extractor run: ' + err.message).setMimeType(ContentService.MimeType.TEXT);
+      }
+    }
+    if (action === 'clear') {
+      try {
+        const mainIter = DriveApp.getFilesByName(DRIVE_FILENAME_MAIN);
+        if (!mainIter.hasNext()) DriveApp.createFile(DRIVE_FILENAME_MAIN, '');
+        else mainIter.next().setContent('');
+        const svIter = DriveApp.getFilesByName(DRIVE_FILENAME_SVSBQQ);
+        if (!svIter.hasNext()) DriveApp.createFile(DRIVE_FILENAME_SVSBQQ, '');
+        else svIter.next().setContent('');
+        return ContentService.createTextOutput('OK: Cleared Drive files.').setMimeType(ContentService.MimeType.TEXT);
+      } catch (err) {
+        Logger.log('doPost(clear) error: ' + (err && err.stack ? err.stack : err));
+        return ContentService.createTextOutput('Error clearing Drive files: ' + err.message).setMimeType(ContentService.MimeType.TEXT);
+      }
+    }
+
+    if (body && Array.isArray(body.resolved)) {
+     try {
+       const mainIter = DriveApp.getFilesByName(DRIVE_FILENAME_MAIN);
+       const file = mainIter.hasNext() ? mainIter.next() : DriveApp.createFile(DRIVE_FILENAME_MAIN, '');
+       const existing = file.getBlob().getDataAsString();
+       const footer = body.resolved.map(u => `RESOLVED | ${u}`).join('\n');
+       file.setContent((existing ? (existing + '\n') : '') + footer);
+
+       // Log before calling
+       Logger.log(`doPost: About to call postProcessMainFile() after appending ${body.resolved.length} lines`);
+       // call and capture explicit result or exception
+       let postResult;
+       try {
+         postResult = postProcessMainFile();
+         Logger.log('doPost: postProcessMainFile() returned: ' + String(postResult));
+       } catch (innerErr) {
+         // If postProcess throws, log it and include in response
+         Logger.log('doPost: postProcessMainFile threw: ' + (innerErr && innerErr.stack ? innerErr.stack : innerErr));
+         return ContentService
+           .createTextOutput(`Appended ${body.resolved.length} | postProcessMainFile: THROW`)
+           .setMimeType(ContentService.MimeType.TEXT);
+       }
+
+       // Return the post-process result explicitly to the client (helps the extension)
+       return ContentService
+         .createTextOutput(`Appended ${body.resolved.length} | postProcessMainFile: ${String(postResult)}`)
+         .setMimeType(ContentService.MimeType.TEXT);
+
+     } catch (err) {
+       Logger.log('doPost(resolved) error: ' + (err && err.stack ? err.stack : err));
+       return ContentService.createTextOutput('Error handling resolved URLs: ' + err.message).setMimeType(ContentService.MimeType.TEXT);
+     }
+   }
+
+    return ContentService.createTextOutput('Bad payload — expected {"action":"run"|"clear"} or {"resolved":[...]}').setMimeType(ContentService.MimeType.TEXT);
+
+  } catch (err) {
+    Logger.log('doPost top-level error: ' + (err && err.stack ? err.stack : err));
+    return ContentService.createTextOutput('Internal error: ' + err.message).setMimeType(ContentService.MimeType.TEXT);
+  } finally {
+    flushDebugLog(); // <-- flush once here
+  }
+}

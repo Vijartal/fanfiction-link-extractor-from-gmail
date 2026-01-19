@@ -1,0 +1,721 @@
+/**
+ * auth.gs (enhanced) with deployment disable/kill-switch
+ *
+ * Add this file to the same Apps Script project as your main file.
+ * Run setSharedToken() once from the editor OR set the property in Project Settings.
+ *
+ * IMPORTANT: After running setSharedToken() remove or comment out the function
+ * so the secret is not left in code.
+ */
+
+/***********************
+ * AUTH CONFIG + INIT
+ *
+ * Paste this near the top of auth.gs (before other functions).
+ * After adding, run initAuthDefaults() once from the editor.
+ ***********************/
+
+// Default init configuration (edit only if you know what you want)
+const AUTH_INIT_CONFIG = {
+  // If you want a default ADMIN_EMAIL here, set it (otherwise set in Script Properties)
+  DEFAULT_ADMIN_EMAIL: '',
+
+  // Default alert interval in minutes (if not set in properties)
+  DEFAULT_AUTH_ALERT_MINUTES: '5',
+
+  // Behavior: when 'DEPLOYMENT_DISABLE_MANUAL_ONLY' === 'true', the lock will only be cleared manually.
+  // Set to 'false' if you want expiry-based temporary locks to auto-clear.
+  DEFAULT_DEPLOY_MANUAL_ONLY: 'true',
+
+  // AUTO-LOCK defaults:
+  // Default to auto-lock ON (boolean string) — you can override in Script Properties.
+  DEFAULT_AUTO_LOCK_ENABLED: 'true',
+  // Number of failed attempts within window to trigger auto-lock
+  DEFAULT_AUTO_LOCK_THRESHOLD: '1',
+  // Window length in minutes for counting failed attempts
+  DEFAULT_AUTO_LOCK_WINDOW_MINUTES: '5',
+  // When auto-lock triggers, default behavior is indefinite/manual lock.
+  // If you want temporary auto-lock instead, set AUTO_LOCK_INDEFINITE = 'false' and set AUTO_LOCK_TEMP_MINUTES.
+  DEFAULT_AUTO_LOCK_INDEFINITE: 'true',
+  // If AUTO_LOCK_INDEFINITE === 'false' this value (minutes) will be used as temporary lock duration
+  DEFAULT_AUTO_LOCK_TEMP_MINUTES: '30'
+};
+
+/**
+ * Initialize auth-related Script Properties if they are missing.
+ * Run this once (from editor) after deploying these changes.
+ */
+function initAuthDefaults() {
+  try {
+    const props = PropertiesService.getScriptProperties();
+
+    // ADMIN_EMAIL default (optional)
+    if (props.getProperty('ADMIN_EMAIL') === null && AUTH_INIT_CONFIG.DEFAULT_ADMIN_EMAIL) {
+      props.setProperty('ADMIN_EMAIL', AUTH_INIT_CONFIG.DEFAULT_ADMIN_EMAIL);
+    }
+
+    // AUTH_ALERT_MINUTES default
+    if (props.getProperty('AUTH_ALERT_MINUTES') === null) {
+      props.setProperty('AUTH_ALERT_MINUTES', String(AUTH_INIT_CONFIG.DEFAULT_AUTH_ALERT_MINUTES));
+    }
+
+    // Ensure DEPLOYMENT_DISABLED key exists (default false)
+    if (props.getProperty('DEPLOYMENT_DISABLED') === null) {
+      props.setProperty('DEPLOYMENT_DISABLED', 'false');
+    }
+
+    // Ensure manual-only flag exists (default true)
+    if (props.getProperty('DEPLOYMENT_DISABLE_MANUAL_ONLY') === null) {
+      props.setProperty('DEPLOYMENT_DISABLE_MANUAL_ONLY', String(AUTH_INIT_CONFIG.DEFAULT_DEPLOY_MANUAL_ONLY));
+    }
+
+     // AUTO-LOCK defaults: (populate if missing)
+    if (props.getProperty('AUTO_LOCK_ENABLED') === null) {
+      props.setProperty('AUTO_LOCK_ENABLED', String(AUTH_INIT_CONFIG.DEFAULT_AUTO_LOCK_ENABLED));
+    }
+    if (props.getProperty('AUTO_LOCK_THRESHOLD') === null) {
+      props.setProperty('AUTO_LOCK_THRESHOLD', String(AUTH_INIT_CONFIG.DEFAULT_AUTO_LOCK_THRESHOLD));
+    }
+    if (props.getProperty('AUTO_LOCK_WINDOW_MINUTES') === null) {
+      props.setProperty('AUTO_LOCK_WINDOW_MINUTES', String(AUTH_INIT_CONFIG.DEFAULT_AUTO_LOCK_WINDOW_MINUTES));
+    }
+    if (props.getProperty('AUTO_LOCK_INDEFINITE') === null) {
+      props.setProperty('AUTO_LOCK_INDEFINITE', String(AUTH_INIT_CONFIG.DEFAULT_AUTO_LOCK_INDEFINITE));
+    }
+    if (props.getProperty('AUTO_LOCK_TEMP_MINUTES') === null) {
+      props.setProperty('AUTO_LOCK_TEMP_MINUTES', String(AUTH_INIT_CONFIG.DEFAULT_AUTO_LOCK_TEMP_MINUTES));
+    }
+
+    Logger.log('initAuthDefaults: completed. Current props snapshot: ' +
+      JSON.stringify({
+        ADMIN_EMAIL: props.getProperty('ADMIN_EMAIL'),
+        AUTH_ALERT_MINUTES: props.getProperty('AUTH_ALERT_MINUTES'),
+        DEPLOYMENT_DISABLED: props.getProperty('DEPLOYMENT_DISABLED'),
+        DEPLOYMENT_DISABLE_MANUAL_ONLY: props.getProperty('DEPLOYMENT_DISABLE_MANUAL_ONLY')
+      })
+    );
+    return true;
+  } catch (err) {
+    Logger.log('initAuthDefaults error: ' + (err && err.stack ? err.stack : err));
+    throw err;
+  }
+}
+
+/* -------------------------
+   Token / Shared secret
+   ------------------------- */
+
+// Run once (from editor) to set the shared token, or use Project Settings -> Script properties.
+function setSharedToken() {
+  const TOKEN = 'paste-your-generated-token-here'; // <-- REPLACE with your token (no spaces)
+  PropertiesService.getScriptProperties().setProperty('SHARED_TOKEN', TOKEN);
+}
+
+// Return server-side expected token (empty string if not set)
+function getExpectedToken() {
+  return PropertiesService.getScriptProperties().getProperty('SHARED_TOKEN') || '';
+}
+
+/* -------------------------
+   Token extraction & verify
+   ------------------------- */
+
+/**
+ * Extract incoming token from the request.
+ * Prefer Authorization header (Bearer), fallback to JSON body field `token`, then fallback to e.parameter.token.
+ */
+function extractIncomingToken(e) {
+  try {
+    // 1) headers (Authorization: Bearer <token>)
+    if (e && e.headers) {
+      const auth = e.headers['Authorization'] || e.headers['authorization'];
+      if (auth && typeof auth === 'string' && auth.toLowerCase().startsWith('bearer ')) {
+        return auth.slice(7).trim();
+      }
+    }
+  } catch (err) {
+    // ignore and fallback
+  }
+
+  // 2) JSON body token
+  try {
+    if (e && e.postData && e.postData.contents) {
+      const body = JSON.parse(e.postData.contents || '{}');
+      if (body && body.token) return String(body.token).trim();
+    }
+  } catch (err) {
+    // ignore
+  }
+
+  // 3) form/query param
+  try {
+    if (e && e.parameter && e.parameter.token) return String(e.parameter.token).trim();
+  } catch (err) {}
+
+  return '';
+}
+
+/**
+ * Verify token; returns true if verified, false otherwise.
+ * On failure sends a security alert (email or Drive fallback), with rate-limiting.
+ * Also respects deployment disable flag (kill-switch). If deployment is disabled the request will be rejected.
+ */
+function verifyToken(e) {
+  // run initialization once (first incoming request); no-op thereafter
+  ensureInitDone();
+
+  // 1) strict kill-switch check first — ALWAYS block if disabled
+  const disabledInfo = getDeploymentDisabledInfo();
+  if (disabledInfo && disabledInfo.disabled) {
+    // Use a specific reason so notifyAuthFailure can include "LOCKED"
+    notifyAuthFailure(e, extractIncomingToken(e), 'Deployment LOCKED: ' + (disabledInfo.reason || 'no reason supplied'));
+    // Immediately return false (do not check token)
+    return false;
+  }
+
+  // 2) then the normal token check
+  const expected = getExpectedToken();
+  const incoming = extractIncomingToken(e);
+
+  if (!expected) {
+    notifyAuthFailure(e, incoming, 'No expected token configured');
+    return false;
+  }
+
+  const ok = incoming === expected;
+  if (!ok) {
+    // record failed attempt and possibly trigger auto-lock
+    recordFailedAuthAttempt(incoming, e);
+    notifyAuthFailure(e, incoming, 'Token mismatch');
+    return false;
+  }
+
+  // successful auth -> reset failed attempt counter
+  resetFailedAuthCounter();
+  return true;
+}
+
+/* ============================
+   ALERT / NOTIFICATION HELPERS
+   ============================ */
+
+/**
+ * Return admin email to notify.
+ * Priority:
+ *  - Script property 'ADMIN_EMAIL'
+ *  - Session.getActiveUser().getEmail()
+ *  - Session.getEffectiveUser().getEmail()
+ *  - null if none found
+ */
+function getAdminEmail() {
+  try {
+    const prop = PropertiesService.getScriptProperties().getProperty('ADMIN_EMAIL');
+    if (prop && prop.trim()) return prop.trim();
+  } catch (e) { /* ignore */ }
+
+  try {
+    if (Session && Session.getActiveUser && Session.getActiveUser().getEmail) {
+      const a = Session.getActiveUser().getEmail();
+      if (a) return a;
+    }
+  } catch (e) { /* ignore */ }
+
+  try {
+    if (Session && Session.getEffectiveUser && Session.getEffectiveUser().getEmail) {
+      const euser = Session.getEffectiveUser().getEmail();
+      if (euser) return euser;
+    }
+  } catch (e) { /* ignore */ }
+
+  return null;
+}
+
+/**
+ * Simple rate limiting for alerts to avoid spamming.
+ * Default interval (minutes) is 5, can be overridden by script property 'AUTH_ALERT_MINUTES'.
+ */
+function shouldSendAuthAlert() {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const lastTs = Number(props.getProperty('LAST_AUTH_ALERT_TS') || '0');
+    const configured = Number(props.getProperty('AUTH_ALERT_MINUTES') || '5');
+    const now = Date.now();
+    const thresholdMs = Math.max(1, configured) * 60 * 1000;
+    if (now - lastTs < thresholdMs) {
+      return false;
+    }
+    props.setProperty('LAST_AUTH_ALERT_TS', String(now));
+    return true;
+  } catch (e) {
+    // If properties access fails, allow sending (safer to alert).
+    return true;
+  }
+}
+
+/**
+ * Mask the incoming token for inclusion in logs/alerts.
+ * Show up to first 6 chars and last 2 chars with dots in middle, or '(<empty>)'
+ */
+function maskToken(tok) {
+  try {
+    if (!tok) return '(empty)';
+    const s = String(tok);
+    if (s.length <= 8) return s.slice(0,2) + '...' + s.slice(-1);
+    return s.slice(0,6) + '...' + s.slice(-2);
+  } catch (e) {
+    return '(unreadable)';
+  }
+}
+
+/**
+ * Compose a diagnostic summary from the event object `e`, redacting sensitive bits.
+ * Truncates long bodies for safety.
+ */
+function composeDiagnostics(e) {
+  const MAX_BODY = 2000;
+  const safe = {};
+
+  try {
+    safe.timestamp = new Date().toISOString();
+    safe.headers = (e && e.headers) ? e.headers : {};
+    safe.parameter = (e && e.parameter) ? e.parameter : {};
+    // Post data — include only truncated contents for debug
+    try {
+      const raw = (e && e.postData && e.postData.contents) ? String(e.postData.contents) : '';
+      safe.postData = raw.length > MAX_BODY ? raw.slice(0, MAX_BODY) + '...[truncated]' : raw;
+    } catch (pe) {
+      safe.postData = '(failed to read)';
+    }
+  } catch (err) {
+    return { note: 'failed to compose diagnostics' };
+  }
+  return safe;
+}
+
+/**
+ * Notify about an authentication failure.
+ * Attempts to send an email to admin; if that fails, creates a Drive file.
+ * Respects rate-limiting.
+ */
+function notifyAuthFailure(e, incomingToken, reason) {
+  try {
+    if (!shouldSendAuthAlert()) {
+      Logger.log('notifyAuthFailure: skipped due to rate limit. reason=' + String(reason));
+      return;
+    }
+
+    const admin = getAdminEmail();
+    const subj = 'SECURITY ALERT: Apps Script auth failure';
+    const masked = maskToken(incomingToken);
+    const diag = composeDiagnostics(e);
+
+    let body = [
+      'Authentication FAILURE detected',
+      'Reason: ' + (reason || '(unspecified)'),
+      'Time (UTC): ' + new Date().toISOString(),
+      'Incoming token (masked): ' + masked,
+      '',
+      'Diagnostics:',
+      JSON.stringify(diag, null, 2),
+      '',
+      'Note: expected (server) token is NOT included here.'
+    ].join('\n');
+
+    // Try email first (MailApp is the simplest built-in option)
+    if (admin) {
+      try {
+        MailApp.sendEmail({
+          to: admin,
+          subject: subj,
+          body: body
+        });
+        Logger.log('notifyAuthFailure: email sent to ' + admin);
+        return;
+      } catch (mailErr) {
+        Logger.log('notifyAuthFailure: MailApp.sendEmail failed: ' + (mailErr && mailErr.stack ? mailErr.stack : mailErr));
+        // fall through to Drive fallback
+      }
+    } else {
+      Logger.log('notifyAuthFailure: no admin email configured; will fallback to Drive file');
+    }
+
+    // Fallback: write a file to Drive so owner is notified via Drive activity or can inspect
+    try {
+      const filename = 'Auth_Failure_ALERT_' + Utilities.formatDate(new Date(), Session.getScriptTimeZone ? Session.getScriptTimeZone() : 'UTC', 'yyyyMMdd-HHmmss') + '.txt';
+      DriveApp.createFile(filename, body);
+      Logger.log('notifyAuthFailure: created Drive fallback file: ' + filename);
+    } catch (driveErr) {
+      Logger.log('notifyAuthFailure: Drive fallback failed: ' + (driveErr && driveErr.stack ? driveErr.stack : driveErr));
+    }
+
+  } catch (err) {
+    // Last resort: log
+    try { Logger.log('notifyAuthFailure: unexpected error: ' + (err && err.stack ? err.stack : err)); } catch (e) {}
+  }
+}
+
+/* ====================================
+   Deployment disable / kill-switch API
+   ==================================== */
+
+/**
+ * Returns info about the deployment-disabled state.
+ * {
+ *   disabled: boolean,
+ *   reason: string|null,
+ *   expires: ISOstring|null,
+ *   remainingMs: number|null,
+ *   raw: rawPropertyValue
+ * }
+ *
+ * Behavior:
+ *  - If DEPLOYMENT_DISABLE_MANUAL_ONLY === 'true' (default), a DEPLOYMENT_DISABLED=true will be honored
+ *    indefinitely until clearDeploymentDisabled() is called (no auto-clear).
+ *  - If manual-only is false, expiry logic (DEPLOYMENT_DISABLE_EXPIRES) is considered and auto-cleared when expired.
+ */
+function getDeploymentDisabledInfo() {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const raw = props.getProperty('DEPLOYMENT_DISABLED'); // keep undefined vs '' to help diagnostics
+    const manualOnlyRaw = props.getProperty('DEPLOYMENT_DISABLE_MANUAL_ONLY');
+    const manualOnly = String(manualOnlyRaw || 'true').toLowerCase() === 'true';
+
+    // normalize raw disabled flag
+    const rawNorm = raw ? String(raw).trim().toLowerCase() : '';
+    const disabledFlag = (rawNorm === '1' || rawNorm === 'true' || rawNorm === 'yes');
+
+    if (!disabledFlag) {
+      return { disabled: false, raw: raw, reason: null, expires: null, remainingMs: null };
+    }
+
+    // If manual-only is true, honor the disabled flag indefinitely (no auto-clear)
+    const reason = props.getProperty('DEPLOYMENT_DISABLE_REASON') || null;
+    const expiresRaw = props.getProperty('DEPLOYMENT_DISABLE_EXPIRES') || null;
+
+    if (manualOnly) {
+      // Return disabled state immediately (don't examine expiry)
+      return { disabled: true, raw: raw, reason: reason, expires: expiresRaw || null, remainingMs: null };
+    }
+
+    // If we reach here, manualOnly == false -> allow expiry behavior
+    if (expiresRaw) {
+      const expires = new Date(expiresRaw);
+      if (!isNaN(expires.getTime())) {
+        const now = Date.now();
+        const remaining = expires.getTime() - now;
+        if (remaining <= 0) {
+          // expired -> clear and report not disabled
+          try { clearDeploymentDisabled(); } catch (e) { /* ignore */ }
+          return { disabled: false, raw: raw, reason: null, expires: null, remainingMs: null };
+        }
+        return { disabled: true, raw: raw, reason: reason, expires: expires.toISOString(), remainingMs: remaining };
+      }
+      // parse failed -> treat as indefinite disabled
+    }
+
+    return { disabled: true, raw: raw, reason: reason, expires: null, remainingMs: null };
+  } catch (err) {
+    Logger.log('getDeploymentDisabledInfo error: ' + (err && err.stack ? err.stack : err));
+    // Fail-safe: return not disabled (avoid accidental permanent lock)
+    return { disabled: false, raw: null, reason: null, expires: null, remainingMs: null };
+  }
+}
+
+/**
+ * Set the deployment disabled flag.
+ * Call from editor as: setDeploymentDisabled(minutes, 'reason text')
+ *
+ * Behavior:
+ *  - If DEPLOYMENT_DISABLE_MANUAL_ONLY === 'true' (default), the flag will be set indefinite and any expiry ignored.
+ *  - If manual-only is false, minutes > 0 will set an expiry (temporary disable).
+ *
+ * - minutes: optional number, how many minutes to disable for. If omitted or <=0 then disables indefinitely (or ignored when manual-only enforced).
+ * - reason: optional short reason string (stored in DEPLOYMENT_DISABLE_REASON)
+ */
+function setDeploymentDisabled(minutes, reason) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const manualOnlyRaw = props.getProperty('DEPLOYMENT_DISABLE_MANUAL_ONLY');
+    const manualOnly = String(manualOnlyRaw || 'true').toLowerCase() === 'true';
+
+    props.setProperty('DEPLOYMENT_DISABLED', 'true');
+    if (reason) props.setProperty('DEPLOYMENT_DISABLE_REASON', String(reason).slice(0, 200));
+    else props.deleteProperty('DEPLOYMENT_DISABLE_REASON');
+
+    if (manualOnly) {
+      // enforce manual-only: remove any expiry so it must be cleared manually
+      props.deleteProperty('DEPLOYMENT_DISABLE_EXPIRES');
+      Logger.log('setDeploymentDisabled: manual-only enabled -> set indefinite disable. reason=' + String(reason));
+    } else {
+      if (minutes && Number(minutes) > 0) {
+        const dt = new Date(Date.now() + Number(minutes) * 60 * 1000);
+        props.setProperty('DEPLOYMENT_DISABLE_EXPIRES', dt.toISOString());
+        Logger.log('setDeploymentDisabled: set temporary disable minutes=' + String(minutes) + ', reason=' + String(reason));
+      } else {
+        props.deleteProperty('DEPLOYMENT_DISABLE_EXPIRES');
+        Logger.log('setDeploymentDisabled: set indefinite disable (manual-only not enforced). reason=' + String(reason));
+      }
+    }
+    return true;
+  } catch (err) {
+    Logger.log('setDeploymentDisabled error: ' + (err && err.stack ? err.stack : err));
+    return false;
+  }
+}
+
+/**
+ * Convenience: Set a manual-only deployment disable (preferred, indefinite).
+ * Call from editor: setDeploymentDisabledManual('reason for lock')
+ * This sets DEPLOYMENT_DISABLED=true and removes any expiry — it will remain until clearDeploymentDisabled() is run.
+ */
+function setDeploymentDisabledManual(reason) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    props.setProperty('DEPLOYMENT_DISABLED', 'true');
+    if (reason) props.setProperty('DEPLOYMENT_DISABLE_REASON', String(reason).slice(0,200));
+    props.deleteProperty('DEPLOYMENT_DISABLE_EXPIRES'); // remove any expiry to enforce manual-only
+    Logger.log('setDeploymentDisabledManual: set. reason=' + String(reason));
+    return true;
+  } catch (err) {
+    Logger.log('setDeploymentDisabledManual error: ' + (err && err.stack ? err.stack : err));
+    return false;
+  }
+}
+
+/**
+ * Convenience: set a temporary disable that will expire automatically.
+ * Only used if you explicitly call this function; the default policy remains manual-only.
+ * Call from editor: setDeploymentDisabledTemporary(30, 'temporary work')  // 30 minutes
+ */
+function setDeploymentDisabledTemporary(minutes, reason) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    props.setProperty('DEPLOYMENT_DISABLED', 'true');
+    if (reason) props.setProperty('DEPLOYMENT_DISABLE_REASON', String(reason).slice(0,200));
+    if (minutes && Number(minutes) > 0) {
+      const dt = new Date(Date.now() + Number(minutes) * 60 * 1000);
+      props.setProperty('DEPLOYMENT_DISABLE_EXPIRES', dt.toISOString());
+    } else {
+      props.deleteProperty('DEPLOYMENT_DISABLE_EXPIRES');
+    }
+    Logger.log('setDeploymentDisabledTemporary: minutes=' + String(minutes) + ', reason=' + String(reason));
+    return true;
+  } catch (err) {
+    Logger.log('setDeploymentDisabledTemporary error: ' + (err && err.stack ? err.stack : err));
+    return false;
+  }
+}
+
+/**
+ * Clear the deployment disabled flag.
+ * Call from editor as: clearDeploymentDisabled()
+ */
+function clearDeploymentDisabled() {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    props.deleteProperty('DEPLOYMENT_DISABLED');
+    props.deleteProperty('DEPLOYMENT_DISABLE_REASON');
+    props.deleteProperty('DEPLOYMENT_DISABLE_EXPIRES');
+    Logger.log('clearDeploymentDisabled: cleared');
+    return true;
+  } catch (err) {
+    Logger.log('clearDeploymentDisabled error: ' + (err && err.stack ? err.stack : err));
+    return false;
+  }
+}
+
+/**
+ * Ensure initAuthDefaults() has run once.
+ * - Uses ScriptLock to avoid races.
+ * - Sets AUTH_INIT_DONE = 'true' in Script Properties when finished.
+ * - Best-effort: if lock cannot be acquired, will wait briefly and re-check.
+ */
+function ensureInitDone() {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    if (props.getProperty('AUTH_INIT_DONE') === 'true') return;
+
+    const lock = LockService.getScriptLock();
+    // try to acquire lock quickly (3s). If we don't get it, sleep briefly then re-check.
+    const got = lock.tryLock(3000);
+    if (!got) {
+      // someone else is initializing; wait a moment then re-check
+      Utilities.sleep(500);
+      if (props.getProperty('AUTH_INIT_DONE') === 'true') return;
+      // If still not set, attempt init without holding lock as a last resort
+      try {
+        initAuthDefaults();
+        props.setProperty('AUTH_INIT_DONE', 'true');
+      } catch (e) {
+        Logger.log('ensureInitDone: fallback init failed: ' + (e && e.stack ? e.stack : e));
+      }
+      return;
+    }
+
+    // We have the lock — re-check (double-check) then run init
+    try {
+      if (props.getProperty('AUTH_INIT_DONE') === 'true') return;
+      initAuthDefaults();
+      props.setProperty('AUTH_INIT_DONE', 'true');
+      Logger.log('ensureInitDone: init completed and AUTH_INIT_DONE set');
+    } finally {
+      try { lock.releaseLock(); } catch (e) { /* ignore */ }
+    }
+  } catch (err) {
+    // Do not throw (we don't want to block requests); log and return
+    try { Logger.log('ensureInitDone error: ' + (err && err.stack ? err.stack : err)); } catch (e) {}
+  }
+}
+
+/* =========================
+   OPTIONAL AUTO-LOCK ON FAILED AUTH
+   ========================= */
+
+/* =========================
+   AUTO-LOCK ON FAILED AUTH (config-driven)
+   ========================= */
+
+/**
+ * Read auto-lock configuration. Values come from Script Properties if present,
+ * otherwise fall back to AUTH_INIT_CONFIG defaults.
+ */
+function getAutoLockConfig() {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const enabled = String(props.getProperty('AUTO_LOCK_ENABLED') || AUTH_INIT_CONFIG.DEFAULT_AUTO_LOCK_ENABLED).toLowerCase() === 'true';
+    const threshold = Math.max(1, Number(props.getProperty('AUTO_LOCK_THRESHOLD') || AUTH_INIT_CONFIG.DEFAULT_AUTO_LOCK_THRESHOLD));
+    const windowMin = Math.max(1, Number(props.getProperty('AUTO_LOCK_WINDOW_MINUTES') || AUTH_INIT_CONFIG.DEFAULT_AUTO_LOCK_WINDOW_MINUTES));
+    const indefinite = String(props.getProperty('AUTO_LOCK_INDEFINITE') || AUTH_INIT_CONFIG.DEFAULT_AUTO_LOCK_INDEFINITE).toLowerCase() === 'true';
+    const tempMinutes = Math.max(1, Number(props.getProperty('AUTO_LOCK_TEMP_MINUTES') || AUTH_INIT_CONFIG.DEFAULT_AUTO_LOCK_TEMP_MINUTES));
+    return { enabled, threshold, windowMin, indefinite, tempMinutes };
+  } catch (e) {
+    // safe conservative defaults: enabled (per your request), indefinite lock
+    return { enabled: true, threshold: 5, windowMin: 5, indefinite: true, tempMinutes: 30 };
+  }
+}
+
+/**
+ * Record a failed auth attempt. If threshold is exceeded within configured window,
+ * the function will set the deployment disabled:
+ *  - If AUTO_LOCK_INDEFINITE === 'true' (default) -> setDeploymentDisabledManual(reason)
+ *  - else -> setDeploymentDisabledTemporary(tempMinutes, reason)
+ *
+ * Uses Script Properties keys:
+ *  - FAILED_AUTH_COUNT
+ *  - FAILED_AUTH_WINDOW_START (ms epoch)
+ *
+ * Returns true if auto-lock was triggered.
+ */
+function recordFailedAuthAttempt(incomingToken, e) {
+  try {
+    const cfg = getAutoLockConfig();
+    if (!cfg.enabled) return false;
+
+    const props = PropertiesService.getScriptProperties();
+    // use lock to avoid races
+    const lock = LockService.getScriptLock();
+    const got = lock.tryLock(3000);
+    if (!got) {
+      // best-effort wait then continue
+      Utilities.sleep(200);
+    }
+
+    try {
+      const now = Date.now();
+      const windowMs = cfg.windowMin * 60 * 1000;
+      let start = Number(props.getProperty('FAILED_AUTH_WINDOW_START') || '0');
+      let count = Number(props.getProperty('FAILED_AUTH_COUNT') || '0');
+
+      if (!start || (now - start) > windowMs) {
+        // reset window
+        start = now;
+        count = 1;
+      } else {
+        count = count + 1;
+      }
+
+      props.setProperty('FAILED_AUTH_WINDOW_START', String(start));
+      props.setProperty('FAILED_AUTH_COUNT', String(count));
+
+      Logger.log('recordFailedAuthAttempt: count=' + count + ', windowStart=' + new Date(start).toISOString());
+
+      if (count >= cfg.threshold) {
+        const reason = `Auto-lock: ${count} failed auth attempts within ${cfg.windowMin} minutes`;
+
+        try {
+          if (cfg.indefinite) {
+            // indefinite manual lock (default)
+            setDeploymentDisabledManual(reason);
+            Logger.log('recordFailedAuthAttempt: AUTO-LOCK (indefinite) TRIGGERED -> ' + reason);
+          } else {
+            // temporary lock for configured minutes
+            setDeploymentDisabledTemporary(cfg.tempMinutes, reason);
+            Logger.log('recordFailedAuthAttempt: AUTO-LOCK (temporary ' + cfg.tempMinutes + 'm) TRIGGERED -> ' + reason);
+          }
+        } catch (sErr) {
+          Logger.log('recordFailedAuthAttempt: failed to apply lock: ' + (sErr && sErr.stack ? sErr.stack : sErr));
+        }
+
+        // reset counters after locking
+        props.deleteProperty('FAILED_AUTH_COUNT');
+        props.deleteProperty('FAILED_AUTH_WINDOW_START');
+
+        // alert admin
+        notifyAuthFailure(e, incomingToken, 'AUTO-LOCK triggered: ' + reason);
+        return true;
+      }
+    } finally {
+      try { lock.releaseLock(); } catch (e2) {}
+    }
+  } catch (err) {
+    Logger.log('recordFailedAuthAttempt error: ' + (err && err.stack ? err.stack : err));
+  }
+  return false;
+}
+
+/**
+ * Reset failed-auth counters on successful authentication.
+ */
+function resetFailedAuthCounter() {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    props.deleteProperty('FAILED_AUTH_COUNT');
+    props.deleteProperty('FAILED_AUTH_WINDOW_START');
+    Logger.log('resetFailedAuthCounter: cleared');
+    return true;
+  } catch (e) {
+    Logger.log('resetFailedAuthCounter error: ' + (e && e.stack ? e.stack : e));
+    return false;
+  }
+}
+
+/**
+ * Debug helper to run from the editor (Logs) — shows exact property values.
+ * Run from editor: debugCheckDisable()
+ */
+function debugCheckDisable() {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const raw = props.getProperty('DEPLOYMENT_DISABLED');
+    const reason = props.getProperty('DEPLOYMENT_DISABLE_REASON');
+    const expires = props.getProperty('DEPLOYMENT_DISABLE_EXPIRES');
+    const manualOnly = props.getProperty('DEPLOYMENT_DISABLE_MANUAL_ONLY');
+    Logger.log('DEBUG DEPLOYMENT_DISABLED raw value: [' + String(raw) + ']');
+    Logger.log('DEBUG DEPLOYMENT_DISABLE_REASON: [' + String(reason) + ']');
+    Logger.log('DEBUG DEPLOYMENT_DISABLE_EXPIRES: [' + String(expires) + ']');
+    Logger.log('DEBUG DEPLOYMENT_DISABLE_MANUAL_ONLY: [' + String(manualOnly) + ']');
+    Logger.log('DEBUG getDeploymentDisabledInfo() -> ' + JSON.stringify(getDeploymentDisabledInfo()));
+    return getDeploymentDisabledInfo();
+  } catch (err) {
+    Logger.log('debugCheckDisable error: ' + (err && err.stack ? err.stack : err));
+    throw err;
+  }
+}
+
+/**
+/ * Admin endpoint (callable from editor or via token-protected request) to return current disabled info.
+/ * If you want to call it over HTTP, ensure doGet/doPost permit it (this returns a plain object).
+/ */
+function adminGetDisableInfo() {
+  return getDeploymentDisabledInfo();
+}
