@@ -1,0 +1,305 @@
+// post process 1.gs
+/**
+ * Utility: return unique array preserving order
+ */
+function ensureUniqueArray(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const x of (arr || [])) {
+    if (!seen.has(x)) { seen.add(x); out.push(x); }
+  }
+  return out;
+}
+
+/**
+ * Parse a resolved URL to discover site (SB / SV / QQ) and post id if present.
+ * Returns { source: 'SB'|'SV'|'QQ', id: '12345', link: '<url>' } or null if can't parse.
+ *
+ * Handles:
+ *  - thread URLs with #post-<id>
+ *  - thread URLs where post id may appear as ".<id>" (e.g. slug.33904)
+ *  - thread URLs where post id may appear as "/<id>/"
+ *  - direct posts (/posts/<id>/)
+ */
+function parseResolvedUrl(url) {
+  if (!url || typeof url !== 'string') return null;
+  const u = url.trim();
+  const lower = u.toLowerCase();
+
+  // determine source by domain
+  let source = null;
+  if (lower.indexOf('spacebattles.com') !== -1) source = 'SB';
+  else if (lower.indexOf('sufficientvelocity.com') !== -1) source = 'SV';
+  else if (lower.indexOf('questionablequesting.com') !== -1) source = 'QQ';
+  else return null; // unknown site — do not promote
+
+  // patterns for post / thread id extraction
+  const patterns = [
+    /#post-(\d{5,12})/i,                       // anchor style #post-114016169
+    /\/posts\/(\d{5,12})(?:\/|$)/i,            // direct /posts/12345/ style
+    /post-(\d{5,12})/i,                        // fallback 'post-12345' somewhere
+    /(?:\.|\/)(\d{5,12})(?:\/|$)/i             // dot or slash then digits (handles slug.33904 and /12345/)
+  ];
+
+  for (const p of patterns) {
+    const m = u.match(p);
+    if (m && m[1]) {
+      return { source, id: String(m[1]), link: u };
+    }
+  }
+
+  // couldn't extract an id — return minimal info (will not match extracted SV lines by id)
+  return { source, id: '', link: u };
+}
+
+/**
+ * Normalize RESOLVED / thread urls in a block of text:
+ * - remove /page-\d+ segments
+ * - remove #post-\d+ anchors
+ * - normalize thread URL forms like:
+ *     /threads/<slug>.<id>/...  -> /threads/<slug>.<id>/
+ *     /threads/<slug>/<id>/...  -> /threads/<slug>.<id>/
+ *   so the thread ID is preserved and trailing slash present.
+ * - normalise /posts/<id>/ to canonical trailing slash
+ *
+ * Returns normalized text.
+ */
+function normalizeResolvedAndThreadUrls(text) {
+  if (!text || typeof text !== 'string') return text;
+
+  // 1) Remove /page-N segments and #post-N anchors globally
+  text = text.replace(/\/page-\d+(?=\/|#|$)/gi, '');
+  text = text.replace(/#post-\d+/gi, '');
+
+  // 2) Normalize /threads/<slug>.<id>(/anything)?  -> /threads/<slug>.<id>/
+  //     handles both dot and slash separators for the id
+  text = text.replace(
+    /((?:https?:\/\/)[^\s'"]+?\/threads\/([^\/\s'"]+?))(?:(?:\.|\/)(\d{4,12}))(?:\/[^\s'"]*)?/gi,
+    // capture entire base + ensure slash after id
+    function(_, baseWithSlug, slugPart, idPart) {
+      // baseWithSlug currently ends with /threads/<slug> or includes .<id> depending on input,
+      // rebuild canonical form as: <base>/threads/<slug>.<id>/
+      // Make sure we don't accidentally duplicate a trailing slash.
+      const canonical = baseWithSlug.replace(/\/+$/,'') + '.' + idPart + '/';
+      return canonical;
+    }
+  );
+
+  // 3) Normalize any /threads/.../<id>/ (slash style) -> collapse into slug.id/
+  text = text.replace(
+    /((?:https?:\/\/)[^\s'"]+?\/threads\/([^\/\s'"]+?)\/)(\d{4,12})(?:\/[^\s'"]*)?/gi,
+    function(_, baseWithSlug, slugPart, idPart) {
+      const canonical = baseWithSlug.replace(/\/threads\/.+?\/$/i, '/threads/' + slugPart + '.') + idPart + '/';
+      return canonical;
+    }
+  );
+
+  // 4) Normalize /posts/<id>/ to ensure trailing slash
+  text = text.replace(/(https?:\/\/[^\s'"]+\/posts\/(\d{4,12}))(?:\/[^\s'"]*)?/gi, '$1/');
+
+  // 5) Collapse multiple slashes at the end to a single slash
+  text = text.replace(/\/{2,}/g, '/');
+
+  return text;
+}
+
+/**
+ * Post-process main Drive file to:
+ *  - deduplicate raw RESOLVED lines
+ *  - parse and promote resolved forum entries to top block as "RESOLVED - <SRC> | <url>"
+ *  - keep AO3/FF top entries (lines matching "<SRC> | <id> | <link>")
+ *  - build SV/SB/QQ summary and unresolved list annotated with Resolved/Unresolved
+ *  - preserve deduped raw RESOLVED lines at bottom for audit
+ */
+function postProcessMainFile() {
+  try {
+    Logger.log(">>> postProcessMainFile: entered");
+
+    const mainFile = getOrCreateDriveFile(DRIVE_FILENAME_MAIN);
+    Logger.log("Got mainFile handle");
+
+    let mainText = '';
+    try {
+      mainText = mainFile.getBlob().getDataAsString();
+      Logger.log("Fetched mainText, length=" + mainText.length);
+    } catch (e) {
+      Logger.log("Failed to read mainFile: " + e);
+      mainText = '';
+    }
+
+    // Accept source tokens 2-5 chars (letters/numbers), and allow non-numeric ids (safer).
+    const topEntryRegex = /^\s*([A-Z0-9]{2,5})\s*\|\s*([^\|]+?)\s*\|\s*(\S.*)$/i;
+    const topEntries = [];
+    const otherLines = [];
+    const lines = mainText.split(/\r?\n/);
+    const rawResolvedLines = [];
+
+    Logger.log("Processing lines: count=" + lines.length);
+
+    for (const ln of lines) {
+      const mres = ln.match(/^\s*RESOLVED\s*\|\s*(\S.*)$/i);
+      if (mres && mres[1]) {
+        rawResolvedLines.push(mres[1].trim());
+        continue;
+      }
+      const mt = ln.match(topEntryRegex);
+      if (mt) {
+        const source = String(mt[1]).toUpperCase().trim();
+        const id = String(mt[2]).trim();
+        const link = String(mt[3]).trim();
+        topEntries.push({ source, id, link });
+        continue;
+      }
+      if (ln && ln.trim()) otherLines.push(ln);
+    }
+    Logger.log("rawResolvedLines=" + rawResolvedLines.length + ", topEntries=" + topEntries.length + ", otherLines=" + otherLines.length);
+
+    // dedupe raw resolved lines preserving order
+    const dedupResolvedRaw = ensureUniqueArray(rawResolvedLines);
+    Logger.log("Deduped resolved lines=" + dedupResolvedRaw.length);
+
+    // parse resolved lines (forums only)
+    const parsedResolved = [];
+    const resolvedKeySet = new Set();
+    for (const raw of dedupResolvedRaw) {
+      const parsed = parseResolvedUrl(raw);
+      if (parsed) {
+        // Use normalized key: source-id if id exists else source-link
+        const key = parsed.id ? `${parsed.source}-${parsed.id}` : `${parsed.source}-${parsed.link.replace(/\/+$/,'')}`;
+        if (!resolvedKeySet.has(key)) {
+          parsedResolved.push(parsed);
+          resolvedKeySet.add(key);
+        }
+      }
+    }
+    Logger.log("Parsed resolved entries=" + parsedResolved.length);
+
+    // Build topMap keyed by source-id (or source-link for non-id)
+    const topMap = new Map();
+    for (const e of topEntries) {
+      const k = e.id ? `${e.source}-${e.id}` : `${e.source}-${e.link.replace(/\/+$/,'')}`;
+      if (!topMap.has(k)) topMap.set(k, e);
+    }
+    Logger.log("TopMap initialized, size=" + topMap.size);
+
+    // Merge resolved entries into topMap (promote resolved forum threads)
+    for (const p of parsedResolved) {
+      const key = p.id ? `${p.source}-${p.id}` : `${p.source}-${p.link.replace(/\/+$/,'')}`;
+      if (!topMap.has(key)) {
+        topMap.set(key, { source: p.source, id: p.id || '', link: p.link, resolvedPromoted: true });
+      } else {
+        const existing = topMap.get(key);
+        if (existing && (!existing.link || existing.link.indexOf('http') !== 0)) {
+          existing.link = p.link;
+          existing.resolvedPromoted = true;
+          topMap.set(key, existing);
+        }
+      }
+    }
+    Logger.log("TopMap after merging resolved, size=" + topMap.size);
+
+    // Build 'others' : non-forum entries (FF, AO3, etc.)
+    const others = Array.from(topMap.values()).filter(x => !['SV','SB','QQ'].includes(x.source));
+    others.sort((a,b) => {
+      if (a.source === b.source) return String(a.id || '').localeCompare(String(b.id || ''));
+      return a.source.localeCompare(b.source);
+    });
+    Logger.log("Others built, count=" + others.length);
+
+    // Build promoted resolved text lines for top block
+    const promotedResolved = [];
+    for (const p of parsedResolved) {
+      promotedResolved.push({ source: p.source, id: p.id, link: p.link, text: `RESOLVED - ${p.source} | ${p.link}` });
+    }
+    Logger.log("PromotedResolved built, count=" + promotedResolved.length);
+
+    // Build top block lines: others first (FF/AO3/... ), then promoted resolved entries
+    const topBlockLines = [];
+    for (const o of others) topBlockLines.push(`${o.source} | ${o.id} | ${o.link}`);
+    for (const pr of promotedResolved) topBlockLines.push(pr.text);
+    Logger.log("TopBlockLines built, count=" + topBlockLines.length);
+
+    // Build the svLines list (list of all SV/SB/QQ links) either from the sv file or from topMap/otherLines fallback
+    let svFileText = '';
+    try {
+      const svf = getOrCreateDriveFile(DRIVE_FILENAME_SVSBQQ);
+      svFileText = svf.getBlob().getDataAsString();
+      Logger.log("Read svFileText, length=" + svFileText.length);
+    } catch (e) {
+      Logger.log("Failed to read svFileText: " + e);
+      svFileText = '';
+    }
+
+    let svLines = [];
+    if (svFileText && svFileText.trim()) {
+      svLines = svFileText.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+      Logger.log("svLines loaded from file, count=" + svLines.length);
+    } else {
+      for (const v of topMap.values()) {
+        if (['SV','SB','QQ'].includes(v.source)) svLines.push(v.link);
+      }
+      const R = /https?:\/\/(?:www\.)?(?:forums?\.(?:sufficientvelocity|spacebattles)\.com|forum\.questionablequesting\.com)\/[^\s'"]+/ig;
+      for (const ln of otherLines) {
+        let m;
+        while ((m = R.exec(ln)) !== null) svLines.push(m[0]);
+      }
+      svLines = ensureUniqueArray(svLines);
+      Logger.log("svLines built from fallback, count=" + svLines.length);
+    }
+
+    // Build resolvedKeys (normalized) for fast detection
+    const resolvedKeys = new Set();
+    for (const p of parsedResolved) {
+      if (p.id) resolvedKeys.add(`${p.source}-${p.id}`);
+      else resolvedKeys.add(`${p.source}-${p.link.replace(/\/+$/,'')}`);
+    }
+    Logger.log("resolvedKeys built, count=" + resolvedKeys.size);
+
+    // Annotate SV lines as Resolved / Unresolved (use parseResolvedUrl to get id when possible)
+    const unresolvedAnnotated = [];
+    for (const sv of svLines) {
+      const parsed = parseResolvedUrl(sv) || {};
+      const key = (parsed.source ? parsed.source : '') + '-' + (parsed.id ? parsed.id : parsed.link ? parsed.link.replace(/\/+$/,'') : sv.replace(/\/+$/,''));
+      const isResolved = resolvedKeys.has(key);
+      unresolvedAnnotated.push(`${sv}  - ${isResolved ? 'Resolved' : 'Unresolved'}`);
+    }
+    Logger.log("UnresolvedAnnotated built, count=" + unresolvedAnnotated.length);
+
+    const totalSV = svLines.length;
+    let detectedResolvedCount = 0;
+    for (const sv of svLines) {
+      const parsed = parseResolvedUrl(sv) || {};
+      const key = (parsed.source ? parsed.source : '') + '-' + (parsed.id ? parsed.id : parsed.link ? parsed.link.replace(/\/+$/,'') : sv.replace(/\/+$/,''));
+      if (resolvedKeys.has(key)) detectedResolvedCount++;
+    }
+    const unresolvedCount = totalSV - detectedResolvedCount;
+    Logger.log(`Summary counts: totalSV=${totalSV}, resolved=${detectedResolvedCount}, unresolved=${unresolvedCount}`);
+
+    const sep = '\n\n----- SV/SB/QQ SUMMARY -----\n';
+    const summaryLines = [
+      `Total SV/SB/QQ links: ${totalSV}`,
+      `Resolved (detected): ${detectedResolvedCount}`,
+      `Unresolved: ${unresolvedCount}`,
+      ''
+    ].join('\n');
+
+    const unresolvedSection = 'Unresolved links:\n' + (unresolvedAnnotated.length ? unresolvedAnnotated.join('\n') : 'None') + '\n\n';
+    const resolvedRawHeader = 'Previously RESOLVED lines found (raw):\n';
+    const resolvedRawSection = resolvedRawHeader + (dedupResolvedRaw.length ? dedupResolvedRaw.join('\n') : 'None') + '\n';
+
+    let finalContent = (topBlockLines.length ? (topBlockLines.join('\n') + '\n') : '') + sep + summaryLines + unresolvedSection + resolvedRawSection;
+
+    // 🔽 FINAL CLEANUP STEP: normalize SB/SV/QQ resolved links and thread URLs
+    finalContent = normalizeResolvedAndThreadUrls(finalContent);
+
+    // Write back final content
+    Logger.log("Final content length (post-normalize)=" + finalContent.length);
+    mainFile.setContent(finalContent);
+    Logger.log("mainFile updated successfully");
+
+    return true;
+  } catch (err) {
+    Logger.log('postProcessMainFile error: ' + (err && err.stack ? err.stack : err));
+    return false;
+  }
+}

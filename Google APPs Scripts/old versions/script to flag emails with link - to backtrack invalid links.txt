@@ -1,0 +1,54 @@
+function flagEmailsWithImportantLinks() {
+  const DRIVE_FILE_NAME = 'links to flag.txt'; // Exact name of the file in Google Drive
+  const LABEL_TO_SCAN = 'fanfiction to download/z link extracted';            // Parent label (sublabels will also be scanned)
+  const URGENT_LABEL = 'link invalid';                // Label to apply if a match is found
+
+  const links = getLinksFromDriveFile(DRIVE_FILE_NAME);
+  if (links.length === 0) {
+    Logger.log("No links found in the drive file.");
+    return;
+  }
+
+  const labelThreads = getThreadsFromLabelAndSublabels(LABEL_TO_SCAN);
+  const urgentLabel = GmailApp.getUserLabelByName(URGENT_LABEL) || GmailApp.createLabel(URGENT_LABEL);
+
+  for (const thread of labelThreads) {
+    const messages = thread.getMessages();
+    for (const msg of messages) {
+      const body = msg.getBody();
+      if (links.some(link => body.includes(link))) {
+        msg.star();
+        thread.addLabel(urgentLabel);
+        break; // If one message in the thread matches, treat the thread as a match
+      }
+    }
+  }
+}
+
+// Get the list of links from a Drive text file
+function getLinksFromDriveFile(filename) {
+  const files = DriveApp.getFilesByName(filename);
+  if (!files.hasNext()) return [];
+
+  const file = files.next();
+  const content = file.getBlob().getDataAsString();
+  return content
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line !== '');
+}
+
+// Recursively get threads from a label and all its sublabels
+function getThreadsFromLabelAndSublabels(baseLabel) {
+  const labelObjs = GmailApp.getUserLabels().filter(label =>
+    label.getName() === baseLabel || label.getName().startsWith(baseLabel + '/')
+  );
+
+  let allThreads = [];
+  for (const label of labelObjs) {
+    const threads = label.getThreads();
+    allThreads = allThreads.concat(threads);
+  }
+
+  return allThreads;
+}

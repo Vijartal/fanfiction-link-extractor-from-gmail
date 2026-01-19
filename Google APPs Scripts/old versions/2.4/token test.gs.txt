@@ -1,0 +1,9 @@
+// manually run to check token is set right
+function debugShowTokenMasked() {
+  const t = PropertiesService.getScriptProperties().getProperty('SHARED_TOKEN') || '';
+  if (!t) {
+    Logger.log('SHARED_TOKEN: NOT SET');
+  } else {
+    Logger.log('SHARED_TOKEN (masked): ' + t.slice(0,6) + '...' + t.slice(-6) + '  (length:' + t.length + ')');
+  }
+}

@@ -1,0 +1,159 @@
+// === CONFIGURATION ===
+const SOURCE_LABEL_NAME = 'z-link-to-extract';
+const PROCESSED_LABEL_NAME = 'z-link-extracted';
+const DRIVE_FILENAME_MAIN     = 'FF links extracted from gmail.txt';
+const DRIVE_FILENAME_SVSBQQ   = 'SV_SB_QQ_links.txt';
+const DEBUG                   = true;  
+
+// === MAIN ===
+function extractAndStoreFanficLinks() {
+  const allLabels = GmailApp.getUserLabels().map(l => l.getName());
+  if (DEBUG) Logger.log('All labels: ' + JSON.stringify(allLabels));
+
+  const sourceLabel    = GmailApp.getUserLabelByName(SOURCE_LABEL_NAME);
+  const processedLabel = GmailApp.getUserLabelByName(PROCESSED_LABEL_NAME);
+  if (!sourceLabel) {
+    Logger.log(`No source label '${SOURCE_LABEL_NAME}'`);
+    return;
+  }
+
+  const threads = sourceLabel.getThreads();
+  const allLinks = new Map();
+
+  threads.forEach(thread => {
+    let threadHasLinks = false;
+    thread.getMessages().forEach(msg => {
+      extractLinks(msg.getBody()).forEach(({ source, id, link }) => {
+        const key = `${source}-${id}`;
+        if (!allLinks.has(key)) {
+          allLinks.set(key, { source, id, link });
+          threadHasLinks = true;
+        }
+      });
+    });
+    if (threadHasLinks) {
+      thread.addLabel(processedLabel);
+      thread.removeLabel(sourceLabel);
+    }
+  });
+
+  // Sort links
+  const sorted = Array.from(allLinks.values()).sort((a,b) => {
+    if (a.source === b.source) return a.id.localeCompare(b.id);
+    return a.source.localeCompare(b.source);
+  });
+
+  // Build main output (all sources)
+  const mainOutput = sorted
+    .map(o => `${o.source} | ${o.id} | ${o.link}`)
+    .join('\n');
+  const mainFile = getOrCreateDriveFile(DRIVE_FILENAME_MAIN);
+  mainFile.setContent(mainOutput);
+
+  // Build SV/SB/QQ output for extension
+  const svsbqqOutput = sorted
+    .filter(o => ['SV','SB','QQ'].includes(o.source))
+    .map(o => o.link)
+    .join('\n');
+  const svFile = getOrCreateDriveFile(DRIVE_FILENAME_SVSBQQ);
+  svFile.setContent(svsbqqOutput);
+}
+
+// === LINK EXTRACTION ===
+function extractLinks(body) {
+  const results = [];
+  const regexMap = [
+    { source:'FF',  regex:/https?:\/\/(?:www\.)?fanfiction\.net\/s\/(\d{1,8})(?:\/\d+)?(?:\/[^\s"'<>]*)?/gi },
+    { source:'AO3', regex:/https?:\/\/(?:www\.)?archiveofourown\.org\/works\/(\d+)(?:\/chapters\/\d+)?/gi },
+    { source:'SV',  regex:/https?:\/\/forums\.sufficientvelocity\.com\/posts\/(\d{6,9})\/?/gi },
+    { source:'SB',  regex:/https?:\/\/forums\.spacebattles\.com\/posts\/(\d{6,9})\/?/gi },
+    { source:'QQ',  regex:/https?:\/\/forum\.questionablequesting\.com\/posts\/(\d{6,9})\/?/gi }
+  ];
+  for (const {source,regex} of regexMap) {
+    let m;
+    while ((m = regex.exec(body)) !== null) {
+      results.push({ source, id:m[1], link:m[0] });
+    }
+  }
+  return results;
+}
+
+// === DRIVE HELPERS ===
+function getOrCreateDriveFile(name) {
+  const files = DriveApp.getFilesByName(name);
+  return files.hasNext() ? files.next() : DriveApp.createFile(name, '');
+}
+
+// === WEB APP ENDPOINTS ===
+// NOTE: this project must include your auth.gs (verifyToken/extractIncomingToken/getExpectedToken).
+
+/**
+ * Protected GET: returns the SV_SB_QQ_links.txt (plain text). Requires token.
+ * The token may be supplied as:
+ *  - Authorization: Bearer <token> (preferred),
+ *  - JSON body { "token": "..." } (for POST only; included for completeness),
+ *  - or ?token=<token> query param.
+ */
+function doGet(e) {
+  // verify token
+  if (typeof verifyToken === 'function') {
+    if (!verifyToken(e)) {
+      return ContentService.createTextOutput('Unauthorized').setMimeType(ContentService.MimeType.TEXT);
+    }
+  } else {
+    return ContentService.createTextOutput('Unauthorized').setMimeType(ContentService.MimeType.TEXT);
+  }
+
+  // Return the SV/SB/QQ file content (create empty if missing)
+  const ITER = DriveApp.getFilesByName(DRIVE_FILENAME_SVSBQQ);
+  if (!ITER.hasNext()) {
+    return ContentService.createTextOutput('').setMimeType(ContentService.MimeType.TEXT);
+  }
+
+  const content = ITER.next().getBlob().getDataAsString();
+  return ContentService.createTextOutput(content).setMimeType(ContentService.MimeType.TEXT);
+}
+
+/**
+ * Protected POST: accepts JSON body {"resolved": ["url1","url2", ...]} and appends to main file.
+ * Requires token (same extraction logic as doGet).
+ */
+function doPost(e) {
+  try {
+    // Verify token
+    if (typeof verifyToken === 'function') {
+      if (!verifyToken(e)) {
+        return ContentService.createTextOutput('Unauthorized').setMimeType(ContentService.MimeType.TEXT);
+      }
+    } else {
+      return ContentService.createTextOutput('Unauthorized').setMimeType(ContentService.MimeType.TEXT);
+    }
+
+    // Parse JSON body (expected format: {"resolved":[ "url1", "url2", ... ]})
+    let data = null;
+    if (e && e.postData && e.postData.contents) {
+      try {
+        data = JSON.parse(e.postData.contents);
+      } catch (err) {
+        return ContentService.createTextOutput('Bad payload — invalid JSON').setMimeType(ContentService.MimeType.TEXT);
+      }
+    } else {
+      return ContentService.createTextOutput('Bad payload — missing body').setMimeType(ContentService.MimeType.TEXT);
+    }
+
+    if (!Array.isArray(data.resolved)) {
+      return ContentService.createTextOutput('Bad payload — expected {\"resolved\":[...]}').setMimeType(ContentService.MimeType.TEXT);
+    }
+
+    // Append to main Drive file (create if missing)
+    const mainIter = DriveApp.getFilesByName(DRIVE_FILENAME_MAIN);
+    const file = mainIter.hasNext() ? mainIter.next() : DriveApp.createFile(DRIVE_FILENAME_MAIN, '');
+    const existing = file.getBlob().getDataAsString();
+    const footer = data.resolved.map(u => `RESOLVED | ${u}`).join('\n');
+    file.setContent((existing ? (existing + '\n') : '') + footer);
+
+    return ContentService.createTextOutput(`Appended ${data.resolved.length}`).setMimeType(ContentService.MimeType.TEXT);
+  } catch (err) {
+    return ContentService.createTextOutput('Error: ' + err.message).setMimeType(ContentService.MimeType.TEXT);
+  }
+}

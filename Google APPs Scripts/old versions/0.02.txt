@@ -1,0 +1,77 @@
+/*
+ * Google Apps Script: Extract FanFiction.net Story Links from Gmail and Label Threads
+ * Stores extracted links in a Drive text file called "FF links extracted from gmail.txt" and labels threads as processed.
+ *
+ * Setup:
+ * 1. Create two Gmail labels: one for incoming/unprocessed emails (e.g. 'FFN-Unprocessed')
+ *    and one for processed emails (e.g. 'FFN-Processed').
+ * 2. Deploy this script in script.google.com and grant Gmail and Drive permissions.
+ * 3. Use Edit > Current project's triggers to run `extractFanfictionLinks` on a time-driven schedule.
+ */
+
+const SOURCE_LABEL_NAME = 'fanfics';
+const PROCESSED_LABEL_NAME = 'temp';
+const DRIVE_FILENAME = 'FF links extracted from gmail.txt';
+
+function extractFanfictionLinks() {
+  // Ensure labels exist
+  const sourceLabel = GmailApp.getUserLabelByName(SOURCE_LABEL_NAME) || GmailApp.createLabel(SOURCE_LABEL_NAME);
+  const processedLabel = GmailApp.getUserLabelByName(PROCESSED_LABEL_NAME) || GmailApp.createLabel(PROCESSED_LABEL_NAME);
+
+  // Prepare Drive file (create if missing)
+  let fileIterator = DriveApp.getFilesByName(DRIVE_FILENAME);
+  let file;
+  if (fileIterator.hasNext()) {
+    file = fileIterator.next();
+  } else {
+    file = DriveApp.createFile(DRIVE_FILENAME, '');
+  }
+  // Current content to append
+  let existingContent = file.getBlob().getDataAsString();
+  let newContent = '';
+
+  // Fetch all threads tagged with the source label
+  const threads = sourceLabel.getThreads();
+  if (threads.length === 0) {
+    Logger.log('No threads found with label: ' + SOURCE_LABEL_NAME);
+    return;
+  }
+
+  // Regex to match FanFiction.net story links
+  const linkRegex = /https?:\/\/(?:www\.)?fanfiction\.net\/s\/(\d{1,8})(?:\/\d+)?(?:\/[^\/\s]+)?/gi;
+  let threadsProcessed = 0;
+
+  threads.forEach(thread => {
+    let threadLinks = [];
+    thread.getMessages().forEach(msg => {
+      let match;
+      while ((match = linkRegex.exec(msg.getBody())) !== null) {
+        threadLinks.push({ url: match[0], storyId: match[1] });
+      }
+    });
+
+    if (threadLinks.length > 0) {
+      // Build text entries
+      threadLinks.forEach(linkObj => {
+        newContent += Utilities.formatString('%s  |  %s\n', linkObj.storyId, linkObj.url);
+      });
+
+      // Label thread processed
+      thread.addLabel(processedLabel);
+      // Optionally remove source label
+      // thread.removeLabel(sourceLabel);
+
+      threadsProcessed++;
+    }
+  });
+
+  // Append new links to the Drive file
+  if (newContent) {
+    file.setContent(existingContent + newContent);
+    Logger.log('Appended ' + newContent.split('\n').filter(line => line).length + ' links to ' + DRIVE_FILENAME);
+  } else {
+    Logger.log('No new links found to append.');
+  }
+
+  Logger.log('Extraction complete. Processed ' + threadsProcessed + ' threads.');
+}

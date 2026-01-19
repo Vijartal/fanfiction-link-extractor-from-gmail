@@ -1,0 +1,93 @@
+// === CONFIGURATION ===
+const SOURCE_LABEL_NAME    = 'fanfiction to download/z link to extract';
+const PROCESSED_LABEL_NAME = 'fanfiction to download/z link extracted';
+const DRIVE_FILENAME = 'FF links extracted from gmail.txt';
+const DEBUG = false;  // Set to true to enable logging of label search results
+
+// === MAIN ===
+function extractAndStoreFanficLinks() {
+  const allLabels = GmailApp.getUserLabels().map(label => label.getName());
+  if (DEBUG) Logger.log('All Gmail labels: ' + JSON.stringify(allLabels));
+
+  const sourceLabel = GmailApp.getUserLabelByName(SOURCE_LABEL_NAME);
+  const processedLabel = GmailApp.getUserLabelByName(PROCESSED_LABEL_NAME);
+
+  if (!sourceLabel) {
+    Logger.log(`No source label found matching '${SOURCE_LABEL_NAME}' or its sublabels.`);
+    return;
+  }
+
+  const threads = sourceLabel.getThreads();
+  const allLinks = new Map();
+
+  threads.forEach(thread => {
+    const messages = thread.getMessages();
+    let threadHasLinks = false;
+
+    messages.forEach(message => {
+      const body = message.getBody();
+      extractLinks(body).forEach(({ source, id, link }) => {
+        const key = `${source}-${id}`;
+        if (!allLinks.has(key)) {
+          allLinks.set(key, { source, id, link });
+          threadHasLinks = true;
+        }
+      });
+    });
+
+    if (threadHasLinks) {
+      thread.addLabel(processedLabel);
+      thread.removeLabel(sourceLabel);
+    }
+  });
+
+  const sortedLinks = Array.from(allLinks.values()).sort((a, b) => {
+    if (a.source === b.source) return a.id.localeCompare(b.id);
+    return a.source.localeCompare(b.source);
+  });
+
+  const output = sortedLinks.map(({ source, id, link }) => `${source} | ${id} | ${link}`).join("\n");
+  const file = getOrCreateDriveFile(DRIVE_FILENAME);
+  file.setContent(output);
+}
+
+// === HELPERS ===
+function extractLinks(body) {
+  const results = [];
+  const regexMap = [
+    {
+      source: 'FF',
+      regex: /https?:\/\/(?:www\.)?fanfiction\.net\/s\/(\d{1,8})(?:\/\d+)?(?:\/[^\s"'<>]*)?/gi
+    },
+    {
+      source: 'AO3',
+      regex: /https?:\/\/(?:www\.)?archiveofourown\.org\/works\/(\d+)(?:\/chapters\/\d+)?/gi
+    },
+    {
+      source: 'SV',
+      regex: /https?:\/\/forums\.sufficientvelocity\.com\/posts\/(\d{6,9})\/?/gi
+    },
+    {
+      source: 'SB',
+      regex: /https?:\/\/forums\.spacebattles\.com\/posts\/(\d{6,9})\/?/gi
+    },
+    {
+      source: 'QQ',
+      regex: /https?:\/\/forum\.questionablequesting\.com\/posts\/(\d{6,9})\/?/gi
+    }
+  ];
+
+  for (const { source, regex } of regexMap) {
+    let match;
+    while ((match = regex.exec(body)) !== null) {
+      results.push({ source, id: match[1], link: match[0] });
+    }
+  }
+
+  return results;
+}
+
+function getOrCreateDriveFile(filename) {
+  const files = DriveApp.getFilesByName(filename);
+  return files.hasNext() ? files.next() : DriveApp.createFile(filename, '');
+}

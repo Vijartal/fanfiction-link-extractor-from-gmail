@@ -1,0 +1,24 @@
+// just a debug tool used when originally adding a debug log function
+// do note if you run it with debug = true there is no file size limit as it is not supposed to be used outside dev/diagnostics.
+/**
+ * Quick Debug Logger Tester
+ * Creates a test log entry and flushes it to your debug file
+ */
+function testDebugLogger() {
+  try {
+    // Step 1: log a test message
+    Logger.log("TEST: This is a test log entry.");
+
+    // Step 2: log another one to see multiple entries
+    Logger.log("TEST: Second test message to debug buffer.");
+
+    // Step 3: flush the buffer to the debug file
+    flushDebugLog();
+
+    // Step 4: confirm flush
+    Logger.log("TEST: flushDebugLog() called. Check Drive file '" + DEBUG_LOG_FILE + "' for output.");
+  } catch (err) {
+    // Directly use original Logger to make sure errors are seen
+    Logger.log("TEST: testDebugLogger error: " + (err.stack || err));
+  }
+}

@@ -1,0 +1,130 @@
+// === CONFIGURATION ===
+const SOURCE_LABEL_NAME       = 'Z link to extract';  
+const PROCESSED_LABEL_NAME    = 'Z link extracted';  
+const DRIVE_FILENAME_MAIN     = 'FF links extracted from gmail.txt';
+const DRIVE_FILENAME_SVSBQQ   = 'SV_SB_QQ_links.txt';
+const DEBUG                   = false;  
+
+// === MAIN ===
+function extractAndStoreFanficLinks() {
+  const allLabels = GmailApp.getUserLabels().map(l => l.getName());
+  if (DEBUG) Logger.log('All labels: ' + JSON.stringify(allLabels));
+
+  const sourceLabel    = GmailApp.getUserLabelByName(SOURCE_LABEL_NAME);
+  const processedLabel = GmailApp.getUserLabelByName(PROCESSED_LABEL_NAME);
+  if (!sourceLabel) {
+    Logger.log(`No source label '${SOURCE_LABEL_NAME}'`);
+    return;
+  }
+
+  const threads = sourceLabel.getThreads();
+  const allLinks = new Map();
+
+  threads.forEach(thread => {
+    let threadHasLinks = false;
+    thread.getMessages().forEach(msg => {
+      extractLinks(msg.getBody()).forEach(({ source, id, link }) => {
+        const key = `${source}-${id}`;
+        if (!allLinks.has(key)) {
+          allLinks.set(key, { source, id, link });
+          threadHasLinks = true;
+        }
+      });
+    });
+    if (threadHasLinks) {
+      thread.addLabel(processedLabel);
+      thread.removeLabel(sourceLabel);
+    }
+  });
+
+  // Sort links
+  const sorted = Array.from(allLinks.values()).sort((a,b) => {
+    if (a.source === b.source) return a.id.localeCompare(b.id);
+    return a.source.localeCompare(b.source);
+  });
+
+  // Build main output (all sources)
+  const mainOutput = sorted
+    .map(o => `${o.source} | ${o.id} | ${o.link}`)
+    .join('\n');
+  const mainFile = getOrCreateDriveFile(DRIVE_FILENAME_MAIN);
+  mainFile.setContent(mainOutput);
+
+  // Build SV/SB/QQ output for extension
+  const svsbqqOutput = sorted
+    .filter(o => ['SV','SB','QQ'].includes(o.source))
+    .map(o => o.link)
+    .join('\n');
+  const svFile = getOrCreateDriveFile(DRIVE_FILENAME_SVSBQQ);
+  svFile.setContent(svsbqqOutput);
+}
+
+// === LINK EXTRACTION ===
+function extractLinks(body) {
+  const results = [];
+  const regexMap = [
+    { source:'FF',  regex:/https?:\/\/(?:www\.)?fanfiction\.net\/s\/(\d{1,8})(?:\/\d+)?(?:\/[^\s"'<>]*)?/gi },
+    { source:'AO3', regex:/https?:\/\/(?:www\.)?archiveofourown\.org\/works\/(\d+)(?:\/chapters\/\d+)?/gi },
+    { source:'SV',  regex:/https?:\/\/forums\.sufficientvelocity\.com\/posts\/(\d{6,9})\/?/gi },
+    { source:'SB',  regex:/https?:\/\/forums\.spacebattles\.com\/posts\/(\d{6,9})\/?/gi },
+    { source:'QQ',  regex:/https?:\/\/forum\.questionablequesting\.com\/posts\/(\d{6,9})\/?/gi }
+  ];
+  for (const {source,regex} of regexMap) {
+    let m;
+    while ((m = regex.exec(body)) !== null) {
+      results.push({ source, id:m[1], link:m[0] });
+    }
+  }
+  return results;
+}
+
+// === DRIVE HELPERS ===
+function getOrCreateDriveFile(name) {
+  const files = DriveApp.getFilesByName(name);
+  return files.hasNext() ? files.next() : DriveApp.createFile(name, '');
+}
+
+// === WEB APP ENDPOINTS ===
+
+// 1) Allow extension to GET the SV/SB/QQ list
+function doGet(e) {
+  const fileIter = DriveApp.getFilesByName(DRIVE_FILENAME_SVSBQQ);
+  if (!fileIter.hasNext()) {
+    return ContentService.createTextOutput('')
+      .setMimeType(ContentService.MimeType.TEXT);
+  }
+  const content = fileIter.next().getBlob().getDataAsString();
+  return ContentService.createTextOutput(content)
+    .setMimeType(ContentService.MimeType.TEXT);
+}
+
+// 2) Receive resolved URLs from extension and append to MAIN file
+function doPost(e) {
+  try {
+    const data = JSON.parse(e.postData.contents);
+    if (!Array.isArray(data.resolved)) {
+      return ContentService
+        .createTextOutput('Bad payload')
+        .setMimeType(ContentService.MimeType.TEXT);
+    }
+    const mainIter = DriveApp.getFilesByName(DRIVE_FILENAME_MAIN);
+    if (!mainIter.hasNext()) {
+      return ContentService
+        .createTextOutput('Main file not found')
+        .setMimeType(ContentService.MimeType.TEXT);
+    }
+    const file = mainIter.next();
+    const existing = file.getBlob().getDataAsString();
+    const footer   = data.resolved.map(u => `RESOLVED | ${u}`).join('\n');
+    file.setContent(existing + '\n' + footer);
+
+    return ContentService
+      .createTextOutput(`Appended ${data.resolved.length}`)
+      .setMimeType(ContentService.MimeType.TEXT);
+  }
+  catch (err) {
+    return ContentService
+      .createTextOutput('Error: ' + err.message)
+      .setMimeType(ContentService.MimeType.TEXT);
+  }
+}

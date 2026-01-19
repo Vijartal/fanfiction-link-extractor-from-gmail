@@ -1,0 +1,111 @@
+/*
+ * Google Apps Script: Extract Links from Gmail and Label Threads
+ * Supports nested Gmail labels for source and processed labels.
+ * Extracts story links from FanFiction.net (FF), Archive of Our Own (AO3),
+ * SufficientVelocity forums (SV), SpaceBattles forums (SB),
+ * and QuestionableQuesting forums (QQ).
+ * Outputs to a Drive text file, deduplicating by <source>:<ID> and grouping by domain.
+ * Only labels threads that contain new links, leaving others untouched.
+ *
+ * Setup:
+ * 1. Define SOURCE_LABEL_NAME (e.g. 'Fanfiction/to-extract') and PROCESSED_LABEL_NAME.
+ * 2. Deploy in script.google.com with Gmail and Drive scopes.
+ * 3. Trigger `extractLinks` on a time-driven schedule.
+ */
+
+const SOURCE_LABEL_NAME    = 'fanfiction to download/z link to extract';
+const PROCESSED_LABEL_NAME = 'fanfiction to download/z link extracted';
+const DRIVE_FILENAME       = 'FF links extracted from gmail.txt';
+
+function extractLinks() {
+  // Debug: list labels
+  Logger.log('Labels: ' + JSON.stringify(GmailApp.getUserLabels().map(l => l.getName())));
+
+  // 1. Source labels
+  const labels = [];
+  const exact = GmailApp.getUserLabelByName(SOURCE_LABEL_NAME);
+  if (exact) labels.push(exact);
+  const prefix = SOURCE_LABEL_NAME + '/';
+  GmailApp.getUserLabels().forEach(lbl => {
+    if (lbl.getName().indexOf(prefix) === 0) labels.push(lbl);
+  });
+  if (labels.length === 0) return Logger.log('No source labels found.');
+
+  // 2. Processed label
+  const processedLabel = GmailApp.getUserLabelByName(PROCESSED_LABEL_NAME)
+                         || GmailApp.createLabel(PROCESSED_LABEL_NAME);
+
+  // 3. Drive file
+  const fileIter = DriveApp.getFilesByName(DRIVE_FILENAME);
+  const file = fileIter.hasNext() ? fileIter.next() : DriveApp.createFile(DRIVE_FILENAME, '');
+  let existing = file.getBlob().getDataAsString();
+
+  // 4. Existing keys
+  const existingKeys = new Set(existing.split('\n').map(line => {
+    const p = line.split('|').map(s=>s.trim());
+    return p[0] && p[1] ? p[0] + ':' + p[1] : null;
+  }).filter(Boolean));
+
+  // 5. Regex patterns
+  const patterns = {
+    'FF': /https?:\/\/(?:www\.)?fanfiction\.net\/s\/(\d{1,8})(?:\/\d+)?(?:\/[^\/\s"'<>]+)?/gi,
+    'AO3': /https?:\/\/(?:www\.)?archiveofourown\.org\/works\/(\d{1,8})(?:\/chapters\/\d+)?/gi,
+    'SV': /https?:\/\/(?:forums\.)?sufficientvelocity\.com\/posts\/(\d{1,8})/gi,
+    'SB': /https?:\/\/(?:forums\.)?spacebattles\.com\/posts\/(\d{1,8})/gi,
+    'QQ': /https?:\/\/(?:forum\.)?questionablequesting\.com\/posts\/(\d{1,8})/gi
+  };
+
+  // 6. Collect threads
+  const threadMap = new Map();
+  labels.forEach(lbl => lbl.getThreads().forEach(thr => threadMap.set(thr.getId(), thr)));
+  const threads = Array.from(threadMap.values());
+  Logger.log('Processing ' + threads.length + ' threads');
+
+  // 7. Gather new entries grouped by source
+  const buckets = { 'FF': [], 'AO3': [], 'SV': [], 'SB': [], 'QQ': [] };
+  let threadsProcessed = 0;
+
+  threads.forEach(thread => {
+    let foundInThread = false;
+    thread.getMessages().forEach(msg => {
+      const body = msg.getBody();
+      for (let key in patterns) {
+        let re = patterns[key];
+        let match;
+        while ((match = re.exec(body)) !== null) {
+          const id = match[1];
+          const url = match[0].replace(/["'<>]+$/, '');
+          const compound = key + ':' + id;
+          if (!existingKeys.has(compound)) {
+            buckets[key].push(`${key} | ${id} | ${url}`);
+            existingKeys.add(compound);
+            foundInThread = true;
+          }
+        }
+      }
+    });
+    if (foundInThread) {
+      thread.addLabel(processedLabel);
+      labels.forEach(lbl => thread.removeLabel(lbl));
+      threadsProcessed++;
+    }
+  });
+
+  // 8. Concatenate new content in domain order
+  const order = ['FF','AO3','SV','SB','QQ'];
+  let newContent = '';
+  order.forEach(k => {
+    if (buckets[k].length) {
+      newContent += buckets[k].join('\n') + '\n';
+    }
+  });
+
+  // 9. Save
+  if (newContent) {
+    file.setContent(existing + newContent);
+    Logger.log('Appended ' + newContent.split('\n').filter(l=>l).length + ' links');
+  } else {
+    Logger.log('No new links found');
+  }
+  Logger.log('Done. Threads labeled: ' + threadsProcessed);
+}

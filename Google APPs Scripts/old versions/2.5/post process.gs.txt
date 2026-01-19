@@ -1,0 +1,546 @@
+// post process 1.gs
+/**
+ * Utility: return unique array preserving order
+ */
+function ensureUniqueArray(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const x of (arr || [])) {
+    if (!seen.has(x)) { seen.add(x); out.push(x); }
+  }
+  return out;
+}
+
+/**
+ * Parse a resolved URL to discover site (SB / SV / QQ) and post id if present.
+ * Returns { source: 'SB'|'SV'|'QQ', id: '12345', link: '<url>' } or null if can't parse.
+ *
+ * Handles:
+ *  - thread URLs with #post-<id>
+ *  - thread URLs where post id may appear as ".<id>" (e.g. slug.33904)
+ *  - thread URLs where post id may appear as "/<id>/"
+ *  - direct posts (/posts/<id>/)
+ */
+function parseResolvedUrl(url) {
+  if (!url || typeof url !== 'string') return null;
+  const u = url.trim();
+  const lower = u.toLowerCase();
+
+  // determine source by domain
+  let source = null;
+  if (lower.indexOf('spacebattles.com') !== -1) source = 'SB';
+  else if (lower.indexOf('sufficientvelocity.com') !== -1) source = 'SV';
+  else if (lower.indexOf('questionablequesting.com') !== -1) source = 'QQ';
+  else return null; // unknown site — do not promote
+
+  // patterns for post / thread id extraction
+  const patterns = [
+    /#post-(\d{5,12})/i,                       // anchor style #post-114016169
+    /\/posts\/(\d{5,12})(?:\/|$)/i,            // direct /posts/12345/ style
+    /post-(\d{5,12})/i,                        // fallback 'post-12345' somewhere
+    /(?:\.|\/)(\d{5,12})(?:\/|$)/i             // dot or slash then digits (handles slug.33904 and /12345/)
+  ];
+
+  for (const p of patterns) {
+    const m = u.match(p);
+    if (m && m[1]) {
+      return { source, id: String(m[1]), link: u };
+    }
+  }
+
+  // couldn't extract an id — return minimal info (will not match extracted SV lines by id)
+  return { source, id: '', link: u };
+}
+
+/**
+ * Normalize RESOLVED / thread urls in a block of text:
+ * - remove /page-\d+ segments
+ * - remove #post-\d+ anchors
+ * - normalize thread URL forms like:
+ *     /threads/<slug>.<id>/...  -> /threads/<slug>.<id>/
+ *     /threads/<slug>/<id>/...  -> /threads/<slug>.<id>/
+ *   so the thread ID is preserved and trailing slash present.
+ * - normalise /posts/<id>/ to canonical trailing slash
+ *
+ * Returns normalized text.
+ */
+function normalizeResolvedAndThreadUrls(text) {
+  if (!text || typeof text !== 'string') return text;
+
+  // 1) Remove /page-N segments and #post-N anchors globally
+  text = text.replace(/\/page-\d+(?=\/|#|$)/gi, '');
+  text = text.replace(/#post-\d+/gi, '');
+
+  // 2) Normalize /threads/<slug>.<id>(/anything)?  -> /threads/<slug>.<id>/
+  //     handles both dot and slash separators for the id
+  text = text.replace(
+    /((?:https?:\/\/)[^\s'"]+?\/threads\/([^\/\s'"]+?))(?:(?:\.|\/)(\d{4,12}))(?:\/[^\s'"]*)?/gi,
+    // capture entire base + ensure slash after id
+    function(_, baseWithSlug, slugPart, idPart) {
+      // baseWithSlug currently ends with /threads/<slug> or includes .<id> depending on input,
+      // rebuild canonical form as: <base>/threads/<slug>.<id>/
+      // Make sure we don't accidentally duplicate a trailing slash.
+      const canonical = baseWithSlug.replace(/\/+$/,'') + '.' + idPart + '/';
+      return canonical;
+    }
+  );
+
+  // 3) Normalize any /threads/.../<id>/ (slash style) -> collapse into slug.id/
+  text = text.replace(
+    /((?:https?:\/\/)[^\s'"]+?\/threads\/([^\/\s'"]+?)\/)(\d{4,12})(?:\/[^\s'"]*)?/gi,
+    function(_, baseWithSlug, slugPart, idPart) {
+      const canonical = baseWithSlug.replace(/\/threads\/.+?\/$/i, '/threads/' + slugPart + '.') + idPart + '/';
+      return canonical;
+    }
+  );
+
+  // 4) Normalize /posts/<id>/ to ensure trailing slash
+  text = text.replace(/(https?:\/\/[^\s'"]+\/posts\/(\d{4,12}))(?:\/[^\s'"]*)?/gi, '$1/');
+
+  // 5) Collapse multiple slashes at the end to a single slash
+  text = text.replace(/\/{2,}/g, '/');
+
+  return text;
+}
+
+/**
+ * Post-process main Drive file to:
+ *  - deduplicate raw RESOLVED lines
+ *  - parse and promote resolved forum entries to top block as "RESOLVED - <SRC> | <url>"
+ *  - keep AO3/FF top entries (lines matching "<SRC> | <id> | <link>")
+ *  - build SV/SB/QQ summary and unresolved list annotated with Resolved/Unresolved
+ *  - preserve deduped raw RESOLVED lines at bottom for audit
+ */
+function postProcessMainFile() {
+  try {
+    Logger.log(">>> postProcessMainFile: entered");
+
+    const mainFile = getOrCreateDriveFile(DRIVE_FILENAME_MAIN);
+    Logger.log("Got mainFile handle");
+
+    let mainText = '';
+    try {
+      mainText = mainFile.getBlob().getDataAsString();
+      Logger.log("Fetched mainText, length=" + mainText.length);
+    } catch (e) {
+      Logger.log("Failed to read mainFile: " + e);
+      mainText = '';
+    }
+
+    // Regex to capture existing top lines like "SRC | id | link"
+    const topEntryRegex = /^\s*([A-Z0-9]{2,5})\s*\|\s*([^\|]+?)\s*\|\s*(\S.*)$/i;
+    const topEntries = [];
+    const otherLines = [];
+    const lines = mainText.split(/\r?\n/);
+    const rawResolvedLines = [];
+
+    Logger.log("Processing lines: count=" + lines.length);
+
+    for (const ln of lines) {
+      const mres = ln.match(/^\s*RESOLVED\s*\|\s*(\S.*)$/i);
+      if (mres && mres[1]) {
+        rawResolvedLines.push(mres[1].trim()); // preserve original resolved raw lines exactly
+        continue;
+      }
+      const mt = ln.match(topEntryRegex);
+      if (mt) {
+        const source = String(mt[1]).toUpperCase().trim();
+        const id = String(mt[2]).trim();
+        const link = String(mt[3]).trim();
+        topEntries.push({ source, id, link });
+        continue;
+      }
+      if (ln && ln.trim()) otherLines.push(ln);
+    }
+    Logger.log("rawResolvedLines=" + rawResolvedLines.length + ", topEntries=" + topEntries.length + ", otherLines=" + otherLines.length);
+
+    // Deduplicate raw resolved lines by exact string (preserve anchors/pages)
+    const dedupResolvedRaw = ensureUniqueArray(rawResolvedLines);
+    Logger.log("Deduped resolved lines (exact):=" + dedupResolvedRaw.length);
+
+    // Helper: parse resolved raw into canonical thread info (thread id + canonical URL)
+    function parseResolvedToCanonical(raw) {
+      if (!raw || typeof raw !== 'string') return null;
+      const u = raw.trim();
+      let source = null;
+      if (/forums\.spacebattles\.com/i.test(u)) source = 'SB';
+      else if (/forums\.sufficientvelocity\.com/i.test(u)) source = 'SV';
+      else if (/forum\.questionablequesting\.com/i.test(u)) source = 'QQ';
+      else return null;
+
+      // thread slug.id or /threads/.../<id> or /posts/<id> fallback
+      let m = u.match(/\/threads\/([^\/\s'"]+?)(?:[\/#?]|$)/i);
+      if (m && m[1]) {
+        const slugPart = m[1];
+        const dotMatch = slugPart.match(/(?:^|\.)(\d{3,12})$/);
+        if (dotMatch && dotMatch[1]) {
+          const id = dotMatch[1];
+          const hostMatch = u.match(/^(https?:\/\/[^\/]+)\/threads\//i);
+          const base = hostMatch ? hostMatch[1] : ('https://' + u.split('/')[2]);
+          const canonical = `${base}/threads/${slugPart.replace(/\.\d+$/,'')}.${id}/`;
+          return { source, id: String(id), canonical };
+        }
+        const slashIdMatch = u.match(/\/threads\/[^\/\s'"]+\/(\d{3,12})(?:[\/#?]|$)/i);
+        if (slashIdMatch && slashIdMatch[1]) {
+          const id = slashIdMatch[1];
+          const hostMatch = u.match(/^(https?:\/\/[^\/]+)\/threads\//i);
+          const base = hostMatch ? hostMatch[1] : ('https://' + u.split('/')[2]);
+          const canonical = `${base}/threads/${slugPart}.${id}/`;
+          return { source, id: String(id), canonical };
+        }
+      }
+
+      m = u.match(/\/posts\/(\d{3,12})(?:\/|$)/i);
+      if (m && m[1]) {
+        const id = m[1];
+        const hostMatch = u.match(/^(https?:\/\/[^\/]+)\//i);
+        const base = hostMatch ? hostMatch[1] : ('https://' + u.split('/')[2]);
+        const canonical = `${base}/posts/${id}/`;
+        return { source, id: String(id), canonical };
+      }
+
+      const fallback = u.match(/(\d{5,12})/);
+      if (fallback && fallback[1]) {
+        const id = fallback[1];
+        const hostMatch = u.match(/^(https?:\/\/[^\/]+)\/threads\//i) || u.match(/^(https?:\/\/[^\/]+)\//i);
+        const base = hostMatch ? hostMatch[1] : ('https://' + u.split('/')[2]);
+        if (/\/posts\//i.test(u)) {
+          return { source, id: String(id), canonical: `${base}/posts/${id}/` };
+        } else {
+          return { source, id: String(id), canonical: `${base}/threads/.${id}/` };
+        }
+      }
+      return null;
+    }
+
+    // -------------------------
+    // Count duplicates while building topMap from email-extracted topEntries
+    // -------------------------
+    const totalEmailCounts = {};   // total occurrences in topEntries per source
+    const uniqueEmailAdded = {};   // unique entries from topEntries actually added to topMap per source
+    const dupEmailCounts = {};     // duplicates (not added) per source
+
+    const topMap = new Map();
+    for (const e of topEntries) {
+      const k = e.id ? `${e.source}-${e.id}` : `${e.source}-${e.link.replace(/\/+$/,'')}`;
+
+      // tally total email occurrences
+      totalEmailCounts[e.source] = (totalEmailCounts[e.source] || 0) + 1;
+
+      if (!topMap.has(k)) {
+        topMap.set(k, { source: e.source, id: e.id, link: e.link });
+        uniqueEmailAdded[e.source] = (uniqueEmailAdded[e.source] || 0) + 1;
+      } else {
+        dupEmailCounts[e.source] = (dupEmailCounts[e.source] || 0) + 1;
+      }
+    }
+    Logger.log("TopMap initialized (from emails) size=" + topMap.size);
+    // Merge persisted per-run email duplicate stats (collected during ingestion) into the counts
+    try {
+      const persistedStats = _fetchAndClearEmailDuplicateStats();
+      for (const k of Object.keys(persistedStats.unique || {})) {
+        uniqueEmailAdded[k] = (uniqueEmailAdded[k] || 0) + (persistedStats.unique[k] || 0);
+      }
+      for (const k of Object.keys(persistedStats.dup || {})) {
+        dupEmailCounts[k] = (dupEmailCounts[k] || 0) + (persistedStats.dup[k] || 0);
+      }
+      Logger.log('postProcessMainFile: merged persisted email dup stats: ' + JSON.stringify(persistedStats));
+    } catch (e) {
+      Logger.log('postProcessMainFile: failed to merge persisted email dup stats: ' + e);
+    }
+    // Attempt to parse raw resolved lines into canonical parsedResolved (thread-level) and dedupe by thread id
+    const parsedResolved = [];
+    const resolvedKeySet = new Set();
+    for (const raw of dedupResolvedRaw) {
+      const parsed = parseResolvedToCanonical(raw);
+      if (parsed && parsed.source) {
+        const key = parsed.id ? `${parsed.source}-${parsed.id}` : `${parsed.source}-${(parsed.canonical||raw).replace(/\/+$/,'')}`;
+        if (!resolvedKeySet.has(key)) {
+          parsedResolved.push({ source: parsed.source, id: parsed.id || '', link: parsed.canonical || raw });
+          resolvedKeySet.add(key);
+        }
+      }
+    }
+    Logger.log("Parsed resolved entries (thread-canonical, deduped)=" + parsedResolved.length);
+
+    // Merge parsedResolved into topMap; count duplicates caused by merging (optional separate stat)
+    const mergeDupCounts = {};
+    const mergeUniqueAdded = {};
+    for (const p of parsedResolved) {
+      const key = p.id ? `${p.source}-${p.id}` : `${p.source}-${p.link.replace(/\/+$/,'')}`;
+      if (!topMap.has(key)) {
+        topMap.set(key, { source: p.source, id: p.id || '', link: p.link, resolvedPromoted: true });
+        mergeUniqueAdded[p.source] = (mergeUniqueAdded[p.source] || 0) + 1;
+      } else {
+        mergeDupCounts[p.source] = (mergeDupCounts[p.source] || 0) + 1;
+      }
+    }
+    Logger.log("TopMap after merging resolved, size=" + topMap.size);
+
+    // Build final lists from topMap
+    const others = Array.from(topMap.values()).filter(x => !['SV','SB','QQ'].includes(x.source));
+    others.sort((a,b) => {
+      if (a.source === b.source) return String(a.id || '').localeCompare(String(b.id || ''));
+      return a.source.localeCompare(b.source);
+    });
+
+    const promotedResolved = [];
+    for (const p of parsedResolved) {
+      promotedResolved.push({ source: p.source, id: p.id, link: p.link, text: `RESOLVED - ${p.source} | ${p.link}` });
+    }
+
+    const topBlockLines = [];
+    for (const o of others) topBlockLines.push(`${o.source} | ${o.id} | ${o.link}`);
+    for (const pr of promotedResolved) topBlockLines.push(pr.text);
+
+    // Build SV list (same approach as before)
+    let svFileText = '';
+    try {
+      const svf = getOrCreateDriveFile(DRIVE_FILENAME_SVSBQQ);
+      svFileText = svf.getBlob().getDataAsString();
+      Logger.log("Read svFileText, length=" + svFileText.length);
+    } catch (e) {
+      Logger.log("Failed to read svFileText: " + e);
+      svFileText = '';
+    }
+
+    let svLines = [];
+    if (svFileText && svFileText.trim()) {
+      svLines = svFileText.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+      Logger.log("svLines loaded from file, count=" + svLines.length);
+    } else {
+      for (const v of topMap.values()) {
+        if (['SV','SB','QQ'].includes(v.source)) svLines.push(v.link);
+      }
+      const R = /https?:\/\/(?:www\.)?(?:forums?\.(?:sufficientvelocity|spacebattles)\.com|forum\.questionablequesting\.com)\/[^\s'"]+/ig;
+      for (const ln of otherLines) {
+        let m;
+        while ((m = R.exec(ln)) !== null) svLines.push(m[0]);
+      }
+      svLines = ensureUniqueArray(svLines);
+      Logger.log("svLines built from fallback, count=" + svLines.length);
+    }
+
+    // Build resolved post-id set from dedupResolvedRaw
+    const resolvedPostIdSet = new Set();
+    for (const raw of dedupResolvedRaw) {
+      try {
+        let src = null;
+        if (/forums\.spacebattles\.com/i.test(raw)) src = 'SB';
+        else if (/forums\.sufficientvelocity\.com/i.test(raw)) src = 'SV';
+        else if (/forum\.questionablequesting\.com/i.test(raw)) src = 'QQ';
+        if (!src) continue;
+
+        let m;
+        const patterns = [/#[pP]ost-(\d{3,12})/g, /post-(\d{3,12})/g, /\/posts\/(\d{3,12})(?:\/|$)/g];
+        for (const p of patterns) {
+          while ((m = p.exec(raw)) !== null) {
+            if (m && m[1]) resolvedPostIdSet.add(`${src}-${m[1]}`);
+          }
+        }
+      } catch (e) {}
+    }
+    Logger.log("Resolved post-id set built, count=" + resolvedPostIdSet.size);
+
+    // Annotate SV lines as Resolved / Unresolved using thread-id OR post-id matches
+    const unresolvedAnnotated = [];
+    let detectedResolvedCount = 0;
+    for (const sv of svLines) {
+      const parsed = parseResolvedToCanonical(sv) || {};
+      const threadKey = (parsed.source ? parsed.source : '') + '-' + (parsed.id ? parsed.id : (parsed.canonical ? parsed.canonical.replace(/\/+$/,'') : sv.replace(/\/+$/,'')));
+
+      let postId = null;
+      const mpost = sv.match(/\/posts\/(\d{3,12})(?:\/|$)/i) || sv.match(/#post-(\d{3,12})/i) || sv.match(/post-(\d{3,12})/i);
+      if (mpost && mpost[1]) postId = mpost[1];
+
+      let isResolved = false;
+      if (threadKey && resolvedKeySet.has(threadKey)) isResolved = true;
+      else if (parsed.source && postId && resolvedPostIdSet.has(`${parsed.source}-${postId}`)) isResolved = true;
+      else {
+        if (!isResolved && postId) {
+          let detectedSource = null;
+          if (/forums\.spacebattles\.com/i.test(sv)) detectedSource = 'SB';
+          else if (/forums\.sufficientvelocity\.com/i.test(sv)) detectedSource = 'SV';
+          else if (/forum\.questionablequesting\.com/i.test(sv)) detectedSource = 'QQ';
+          if (detectedSource && resolvedPostIdSet.has(`${detectedSource}-${postId}`)) isResolved = true;
+        }
+      }
+
+      unresolvedAnnotated.push(`${sv}  - ${isResolved ? 'Resolved' : 'Unresolved'}`);
+      if (isResolved) detectedResolvedCount++;
+    }
+
+    const totalSV = svLines.length;
+    const unresolvedCount = totalSV - detectedResolvedCount;
+    Logger.log(`Summary counts: totalSV=${totalSV}, resolved=${detectedResolvedCount}, unresolved=${unresolvedCount}`);
+
+    const sep = '\n\n----- SV/SB/QQ SUMMARY -----\n';
+    const summaryLines = [
+      `Total SV/SB/QQ links: ${totalSV}`,
+      `Resolved (detected): ${detectedResolvedCount}`,
+      `Unresolved: ${unresolvedCount}`,
+      ''
+    ].join('\n');
+
+    const unresolvedSection = 'Unresolved links:\n' + (unresolvedAnnotated.length ? unresolvedAnnotated.join('\n') : 'None') + '\n\n';
+    const resolvedRawHeader = 'Previously RESOLVED lines found (raw):\n';
+    const resolvedRawSection = resolvedRawHeader + (dedupResolvedRaw.length ? dedupResolvedRaw.join('\n') : 'None') + '\n';
+
+     // ----------------- DUPLICATE COUNTS (including merge duplicates, includes SV/SB/QQ) -----------------
+    // Build a canonical key -> occurrences list using:
+    //  - all lines in 'lines' (main file text parsed earlier)
+    //  - all lines discovered in svLines (SV/SB/QQ file)
+    //
+    // Canonical key rules:
+    //  - non-forum: SRC-<id> when id present, else SRC-<normalized-url>
+    //  - forum: prefer SRC-<postId> or SRC-<threadId> via parseResolvedToCanonical(), else SRC-<normalized-url>
+    const keyMap = new Map(); // key -> { source: 'FF'|'AO3'|'SV'..., occurrences: [originalLine,...] }
+
+    // helper: normalize url fallback
+    function _normUrl(u) {
+      if (!u) return '';
+      return String(u).split('#')[0].replace(/\/+$/,'');
+    }
+
+    // helper: push occurrence
+    function _addOccurrence(key, src, line) {
+      if (!key) return;
+      if (!keyMap.has(key)) keyMap.set(key, { source: src || key.split('-')[0], occurrences: [] });
+      keyMap.get(key).occurrences.push(line || '');
+    }
+
+    // 1) scan the main file 'lines' (we parsed this earlier) for top entries and any raw URLs
+    const urlRx = /https?:\/\/[^\s'"]+/ig;
+    for (const ln of lines) {
+      if (!ln || !ln.trim()) continue;
+      // top-entry style "SRC | id | link"
+      const mt = ln.match(/^\s*([A-Z0-9]{2,5})\s*\|\s*([^\|]+?)\s*\|\s*(\S.*)$/i);
+      if (mt) {
+        const src = String(mt[1]).toUpperCase();
+        const id = String(mt[2] || '').trim();
+        const link = String(mt[3] || '').trim();
+        const key = id ? `${src}-${id}` : `${src}-${_normUrl(link)}`;
+        _addOccurrence(key, src, ln);
+        continue;
+      }
+
+      // raw RESOLVED lines or other lines may contain forum links or plain URLs
+      let m;
+      while ((m = urlRx.exec(ln)) !== null) {
+        const url = m[0];
+        // try parseResolvedToCanonical (exists earlier in this file)
+        let parsed = null;
+        try { parsed = parseResolvedToCanonical(url); } catch (e) { parsed = null; }
+        if (parsed && parsed.source) {
+          const key = parsed.id ? `${parsed.source}-${parsed.id}` : `${parsed.source}-${(parsed.canonical || url).replace(/\/+$/,'')}`;
+          _addOccurrence(key, parsed.source, ln);
+        } else {
+          // fallback: try to guess forum host or make RAW
+          let srcGuess = 'RAW';
+          if (/forums\.spacebattles\.com/i.test(url)) srcGuess = 'SB';
+          else if (/forums\.sufficientvelocity\.com/i.test(url)) srcGuess = 'SV';
+          else if (/forum\.questionablequesting\.com/i.test(url)) srcGuess = 'QQ';
+          _addOccurrence(`${srcGuess}-${_normUrl(url)}`, srcGuess, ln);
+        }
+      }
+    }
+
+    // 2) include the svLines (SV/SB/QQ file) which may contain forum links not present in main file
+    for (const sline of svLines) {
+      if (!sline || !sline.trim()) continue;
+      let parsed = null;
+      try { parsed = parseResolvedToCanonical(sline); } catch (e) { parsed = null; }
+      if (parsed && parsed.source) {
+        const key = parsed.id ? `${parsed.source}-${parsed.id}` : `${parsed.source}-${(parsed.canonical || sline).replace(/\/+$/,'')}`;
+        _addOccurrence(key, parsed.source, sline);
+      } else {
+        // fallback to host-based guess
+        let srcGuess = 'SB';
+        if (/sufficientvelocity/i.test(sline)) srcGuess = 'SV';
+        else if (/questionablequesting/i.test(sline)) srcGuess = 'QQ';
+        _addOccurrence(`${srcGuess}-${_normUrl(sline)}`, srcGuess, sline);
+      }
+    }
+
+    // 3) compute per-source totals and duplicate totals (occurrences vs unique)
+    const occurrenceCounts = {}; // source -> total occurrences (lines)
+    const uniqueKeyCounts = {};  // source -> unique canonical keys
+    const dupOccurrenceCounts = {}; // source -> total duplicate occurrences (occ - uniqueKeys)
+    const duplicateKeyDetails = {}; // source -> { key: count, ... } for keys with count>1
+
+    for (const [key, info] of keyMap.entries()) {
+      const src = (info.source || key.split('-')[0] || '').toUpperCase();
+      const occ = info.occurrences.length || 0;
+      occurrenceCounts[src] = (occurrenceCounts[src] || 0) + occ;
+      uniqueKeyCounts[src] = (uniqueKeyCounts[src] || 0) + 1;
+      if (occ > 1) {
+        dupOccurrenceCounts[src] = (dupOccurrenceCounts[src] || 0) + (occ - 1);
+        duplicateKeyDetails[src] = duplicateKeyDetails[src] || {};
+        duplicateKeyDetails[src][key] = occ;
+      }
+    }
+
+    // ensure forum sources always present in reporting
+    ['SV','SB','QQ'].forEach(s => { occurrenceCounts[s] = occurrenceCounts[s] || 0; uniqueKeyCounts[s] = uniqueKeyCounts[s] || 0; dupOccurrenceCounts[s] = dupOccurrenceCounts[s] || 0; });
+
+    // Build dupLines in your requested style: "SRC: <total occurrences>" and "SRC-dup: <dup occurrences>"
+    const dupLines = [];
+    const allSources = Array.from(new Set([].concat(Object.keys(occurrenceCounts), Object.keys(uniqueKeyCounts))).values()).sort();
+    for (const s of allSources) {
+      dupLines.push(`${s}: ${occurrenceCounts[s] || 0}`);
+      dupLines.push(`${s}-dup: ${dupOccurrenceCounts[s] || 0}`);
+    }
+
+    // Also produce a human-readable DUPLICATE DETAILS section: keys that repeat and how many times
+    const detailLines = [];
+    for (const s of Object.keys(duplicateKeyDetails || {}).sort()) {
+      const map = duplicateKeyDetails[s];
+      // group by count: how many keys appear 2x, 3x, etc.
+      const buckets = {};
+      for (const k of Object.keys(map)) {
+        const c = map[k];
+        buckets[c] = (buckets[c] || 0) + 1;
+      }
+      const parts = [];
+      for (const cnt of Object.keys(buckets).map(Number).sort((a,b)=>a-b)) {
+        parts.push(`${buckets[cnt]} key(s) x ${cnt}`);
+      }
+      detailLines.push(`${s}: ${parts.join(', ')} (examples: ${Object.keys(map).slice(0,5).join(', ')})`);
+    }
+
+    const dupBlock = '\n----- DUPLICATE COUNTS -----\n' + (dupLines.length ? (dupLines.join('\n') + '\n\n') : '\n');
+    const dupDetailBlock = (detailLines.length ? ('----- DUPLICATE DETAILS -----\n' + detailLines.join('\n') + '\n\n') : '');
+    // ----------------------------------------------------------------------------------------------
+
+    // ----------------- FINISHED LINK COUNTS (existing) -----------------
+    const finishedCounts = {};
+    let finishedTotal = 0;
+    for (const o of others) {
+      if (!o || !o.source) continue;
+      finishedCounts[o.source] = (finishedCounts[o.source] || 0) + 1;
+      finishedTotal++;
+    }
+    for (const pr of promotedResolved) {
+      if (!pr || !pr.source) continue;
+      finishedCounts[pr.source] = (finishedCounts[pr.source] || 0) + 1;
+      finishedTotal++;
+    }
+    const sourceKeys = Object.keys(finishedCounts).sort();
+    const countLines = [];
+    countLines.push(`Total finished links: ${finishedTotal}`);
+    for (const k of sourceKeys) countLines.push(`${k}: ${finishedCounts[k]}`);
+    const countsBlock = '\n----- FINISHED LINK COUNTS -----\n' + (countLines.length ? (countLines.join('\n') + '\n\n') : '\n');
+    // -------------------------------------------------------------------
+
+    const finalContent = (topBlockLines.length ? (topBlockLines.join('\n') + '\n') : '') + dupBlock + countsBlock + sep + summaryLines + unresolvedSection + resolvedRawSection;
+
+    Logger.log("Final content length (prepared)=" + finalContent.length);
+    mainFile.setContent(finalContent);
+    Logger.log("mainFile updated successfully");
+
+    return true;
+  } catch (err) {
+    Logger.log('postProcessMainFile error: ' + (err && err.stack ? err.stack : err));
+    return false;
+  }
+}

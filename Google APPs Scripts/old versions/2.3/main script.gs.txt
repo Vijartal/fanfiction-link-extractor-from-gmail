@@ -1,0 +1,557 @@
+// set google app script property "SHARED_TOKEN" in settings for security "simplest method is just get and run a cmd prompt command to generate a key"
+// === CONFIGURATION ===
+const SOURCE_LABEL_NAME = 'fanfiction to download';
+const PROCESSED_LABEL_NAME = 'fanfiction to download/z link extracted';
+const DRIVE_FILENAME_MAIN     = 'FF links extracted from gmail.txt';
+const DRIVE_FILENAME_SVSBQQ   = 'SV_SB_QQ_links.txt';
+const DEBUG                   = false;  
+const DEBUG_LOG_FILE = "AppScript_Debug_Log.txt";
+let DEBUG_BUFFER = []; // in-memory buffer
+let ORIGINAL_LOG = null; // will hold original Logger.log
+// === BATCH / RUN-TIME CONFIG ===
+const BATCH_SIZE = 60;                // number of threads processed per batch invocation (tune)
+const MAX_RUN_SECONDS = 270;          // quit this run around this many seconds (leave headroom)
+const BATCH_OFFSET_PROP = 'EXTRACT_BATCH_OFFSET';
+const BATCH_TRIGGER_HANDLER = 'runExtractBatch';
+
+// debug logging - only works if debug = true
+// Buffer a debug message (cheap)
+function debugLog(message) {
+  if (!DEBUG) return;
+  try {
+    DEBUG_BUFFER.push(`[${new Date().toISOString()}] ${String(message)}`);
+  } catch (e) {
+    // keep it cheap and non-throwing
+  }
+}
+
+// Flush buffer to Drive (safe)
+function flushDebugLog() {
+  if (!DEBUG || DEBUG_BUFFER.length === 0) return;
+
+  const runMarker = `\n==== RUN START: ${new Date().toISOString()} ==== \n`;
+  const contentToAppend = runMarker + DEBUG_BUFFER.join("\n") + "\n==== RUN END ====\n";
+
+  try {
+    const file = getOrCreateDebugFile(DEBUG_LOG_FILE);
+
+    // Prefer appendText if available (fast)
+    if (typeof file.appendText === 'function') {
+      file.appendText(contentToAppend);
+    } else {
+      // fallback: read existing content and setContent (less ideal but reliable)
+      try {
+        const existing = file.getBlob().getDataAsString();
+        file.setContent(existing + contentToAppend);
+      } catch (inner) {
+        // fallback to create new file if anything weird happens
+        DriveApp.createFile(DEBUG_LOG_FILE + '.fallback.' + Date.now(), contentToAppend);
+      }
+    }
+  } catch (err) {
+    // Use the original Logger.log (not the wrapped one) so we do NOT re-buffer this error.
+    if (typeof ORIGINAL_LOG === 'function') {
+      try { ORIGINAL_LOG.call(Logger, 'flushDebugLog error: ' + (err && err.stack ? err.stack : err)); } catch(e) {}
+    } else {
+      try { console.error('flushDebugLog error:', err); } catch(e) {}
+    }
+  } finally {
+    // clear buffer always (avoid leaking memory across runs)
+    DEBUG_BUFFER = [];
+  }
+}
+
+// Create/get debug file (separate helper so it can't clash with main getOrCreateDriveFile)
+function getOrCreateDebugFile(filename) {
+  const iter = DriveApp.getFilesByName(filename);
+  return iter.hasNext() ? iter.next() : DriveApp.createFile(filename, '');
+}
+
+// Wrap Logger.log ONCE and preserve original function in ORIGINAL_LOG.
+// This wrapper must run during script startup.
+(function wrapLogger() {
+  try {
+    // preserve original
+    ORIGINAL_LOG = Logger.log && Logger.log.bind(Logger);
+
+    // replace with wrapper that buffers then calls original
+    const orig = ORIGINAL_LOG;
+    Logger.log = function(message) {
+      try { if (DEBUG) debugLog(message); } catch (e) {}
+      // call original logger (may still throw, but that's fine)
+      if (typeof orig === 'function') return orig(message);
+    };
+  } catch (e) {
+    // If wrapping fails, make sure ORIGINAL_LOG isn't null (best effort)
+    try { ORIGINAL_LOG = Logger.log; } catch (ee) {}
+  }
+})();
+
+// === MAIN (updated) ===
+function extractAndStoreFanficLinks() {
+  const allLabels = GmailApp.getUserLabels().map(l => l.getName());
+  if (DEBUG) Logger.log('All labels: ' + JSON.stringify(allLabels));
+
+  const sourceLabel    = GmailApp.getUserLabelByName(SOURCE_LABEL_NAME);
+  const processedLabel = GmailApp.getUserLabelByName(PROCESSED_LABEL_NAME);
+  if (!sourceLabel) {
+    Logger.log(`No source label '${SOURCE_LABEL_NAME}'`);
+    return;
+  }
+
+  const threads = sourceLabel.getThreads();
+  const allLinks = new Map();
+
+  // Collect links from messages
+  threads.forEach(thread => {
+    let threadHasLinks = false;
+    thread.getMessages().forEach(msg => {
+      extractLinks(msg.getBody()).forEach(({ source, id, link }) => {
+        const key = `${source}-${id}`;
+        if (!allLinks.has(key)) {
+          allLinks.set(key, { source, id, link });
+          threadHasLinks = true;
+        }
+      });
+    });
+    if (threadHasLinks) {
+      thread.addLabel(processedLabel);
+      thread.removeLabel(sourceLabel);
+    }
+  });
+
+  // Sorted list of extracted items
+  const sorted = Array.from(allLinks.values()).sort((a,b) => {
+    if (a.source === b.source) return a.id.localeCompare(b.id);
+    return a.source.localeCompare(b.source);
+  });
+
+  // Read existing main file content to discover previously appended RESOLVED lines
+  const mainFile = getOrCreateDriveFile(DRIVE_FILENAME_MAIN);
+  let existingContent = '';
+  try { existingContent = mainFile.getBlob().getDataAsString(); } catch (e) { existingContent = ''; }
+
+  // Parse raw RESOLVED lines (raw strings)
+  const existingResolvedRaw = [];
+  if (existingContent) {
+    const lines = existingContent.split(/\r?\n/);
+    for (const ln of lines) {
+      const m = ln.match(/^\s*RESOLVED\s*\|\s*(\S.*)$/i);
+      if (m && m[1]) existingResolvedRaw.push(m[1].trim());
+    }
+  }
+
+  // Attempt to parse each raw resolved URL into {source,id,link} using existing extractLinks()
+  const parsedResolvedEntries = []; // parsed entries we can reformat into SOURCE|id|link
+  const resolvedKeySet = new Set(); // keys source-id for quick membership test
+  for (const rawUrl of existingResolvedRaw) {
+    const matches = extractLinks(rawUrl); // may return [] if no regex matched
+    if (matches && matches.length) {
+      // Use first match (should be one)
+      const { source, id } = matches[0];
+      const entry = { source, id, link: rawUrl };
+      const key = `${source}-${id}`;
+      if (!resolvedKeySet.has(key)) {
+        parsedResolvedEntries.push(entry);
+        resolvedKeySet.add(key);
+      }
+    } // else: couldn't parse the resolved URL into a known source/id; we keep raw line for audit below
+  }
+
+  // Separate extracted entries into SV/SB/QQ (forum links) and others (AO3, FF, ...)
+  const svsbqq = sorted.filter(o => ['SV','SB','QQ'].includes(o.source));
+  const others = sorted.filter(o => !['SV','SB','QQ'].includes(o.source));
+
+  // Remove from 'svsbqq' any entry that we already have in resolvedKeySet (they are resolved)
+  const unresolvedSvEntries = svsbqq.filter(o => !resolvedKeySet.has(`${o.source}-${o.id}`));
+
+  // Build the top listing:
+  // - include non-forum entries (others)
+  // - include parsedResolvedEntries (so resolved forum posts are shown in the top with other sources)
+  // Avoid duplicates: if a parsedResolved entry matches an entry in 'others' (rare), skip duplication.
+  const topMap = new Map();
+  // add others first
+  for (const o of others) {
+    const k = `${o.source}-${o.id}`;
+    if (!topMap.has(k)) topMap.set(k, { source: o.source, id: o.id, link: o.link });
+  }
+  // add parsed resolved entries (these may be forum posts)
+  for (const r of parsedResolvedEntries) {
+    const k = `${r.source}-${r.id}`;
+    if (!topMap.has(k)) topMap.set(k, { source: r.source, id: r.id, link: r.link });
+  }
+
+  // Convert topMap to sorted array (by source then id)
+  const topEntries = Array.from(topMap.values()).sort((a,b) => {
+    if (a.source === b.source) return a.id.localeCompare(b.id);
+    return a.source.localeCompare(b.source);
+  });
+
+  // Build final main output: top entries formatted, then the SV/SB/QQ summary + unresolved list, then previously RESOLVED raw lines.
+  const topBlock = topEntries.map(o => `${o.source} | ${o.id} | ${o.link}`).join('\n');
+
+  // SV/SB/QQ summary and unresolved list
+  const totalSV = svsbqq.length;
+  const unresolvedCount = unresolvedSvEntries.length;
+  const resolvedCount = totalSV - unresolvedCount;
+
+  const sep = '\n\n----- SV/SB/QQ SUMMARY -----\n';
+  const summaryLines = [
+    `Total SV/SB/QQ links: ${totalSV}`,
+    `Resolved (detected): ${resolvedCount}`,
+    `Unresolved: ${unresolvedCount}`,
+    ''
+  ].join('\n');
+
+  const unresolvedSection = 'Unresolved links:\n' + (unresolvedSvEntries.length ? unresolvedSvEntries.map(sv => sv.link).join('\n') : 'None') + '\n\n';
+
+  const resolvedSectionHeader = 'Previously RESOLVED lines found (raw):\n';
+  const resolvedSection = resolvedSectionHeader + (existingResolvedRaw.length ? existingResolvedRaw.join('\n') : 'None') + '\n';
+
+  const finalMainContent = (topBlock ? (topBlock + '\n') : '') + sep + summaryLines + unresolvedSection + resolvedSection;
+
+  mainFile.setContent(finalMainContent);
+
+  // Build SV/SB/QQ output file used by the extension (unchanged - contains all original SV/SB/QQ links)
+  const svsbqqOutput = sorted
+    .filter(o => ['SV','SB','QQ'].includes(o.source))
+    .map(o => o.link)
+    .join('\n');
+  const svFile = getOrCreateDriveFile(DRIVE_FILENAME_SVSBQQ);
+  svFile.setContent(svsbqqOutput);
+}
+
+// === LINK EXTRACTION ===
+function extractLinks(body) {
+  if (!body || typeof body !== 'string') return [];
+  const results = [];
+
+  // Define patterns as strings so we construct fresh RegExp objects per call.
+  const regexMap = [
+    { source:'FF',  pattern: 'https?:\\/\\/(?:www\\.)?fanfiction\\.net\\/s\\/(\\d{1,8})(?:\\/\\d+)?(?:\\/[\\w\\-\\.%@~:+#?&=]*)?' , flags: 'gi' },
+    { source:'AO3', pattern: 'https?:\\/\\/(?:www\\.)?archiveofourown\\.org\\/works\\/(\\d+)(?:\\/chapters\\/\\d+)?', flags: 'gi' },
+    { source:'SV',  pattern: 'https?:\\/\\/forums\\.sufficientvelocity\\.com\\/posts\\/(\\d{6,9})\\/?', flags: 'gi' },
+    { source:'SB',  pattern: 'https?:\\/\\/forums\\.spacebattles\\.com\\/posts\\/(\\d{6,9})\\/?', flags: 'gi' },
+    { source:'QQ',  pattern: 'https?:\\/\\/forum\\.questionablequesting\\.com\\/posts\\/(\\d{6,9})\\/?', flags: 'gi' }
+  ];
+
+  for (const cfg of regexMap) {
+    // fresh RegExp each call avoids lastIndex issues
+    const regex = new RegExp(cfg.pattern, cfg.flags);
+    let m;
+    while ((m = regex.exec(body)) !== null) {
+      // m[0] is full match, m[1] is captured id
+      results.push({ source: cfg.source, id: String(m[1] || '').trim(), link: m[0] });
+    }
+  }
+  return results;
+}
+
+function runExtractBatch() {
+  const start = Date.now();
+  const maxMs = (MAX_RUN_SECONDS || 270) * 1000;
+  const marginMs = 2000; // stop a little early to allow clean up
+  const props = PropertiesService.getScriptProperties();
+
+  const sourceLabel = GmailApp.getUserLabelByName(SOURCE_LABEL_NAME);
+  if (!sourceLabel) {
+    Logger.log('runExtractBatch: source label not found: ' + SOURCE_LABEL_NAME);
+    clearBatchStateAndTriggers();
+    return;
+  }
+  // create processed label if missing so addLabel won't fail
+  let processedLabel = GmailApp.getUserLabelByName(PROCESSED_LABEL_NAME);
+  if (!processedLabel) processedLabel = GmailApp.createLabel(PROCESSED_LABEL_NAME);
+
+  let offset = Number(props.getProperty(BATCH_OFFSET_PROP) || '0');
+  Logger.log(`runExtractBatch: starting at offset=${offset}`);
+
+  // fetch a batch of threads starting at 'offset'
+  const threads = sourceLabel.getThreads(offset, BATCH_SIZE);
+  if (!threads || threads.length === 0) {
+    Logger.log('runExtractBatch: no threads at offset; finishing and clearing state.');
+    clearBatchStateAndTriggers();
+    return;
+  }
+
+  // local collection for this run (we'll merge to Drive / post-process at end)
+  const allLinks = new Map();
+
+  for (let i = 0; i < threads.length; i++) {
+    // time check
+    if (Date.now() - start > (maxMs - marginMs)) {
+      // save where we stopped and schedule next batch
+      const newOffset = offset + i;
+      props.setProperty(BATCH_OFFSET_PROP, String(newOffset));
+      Logger.log(`runExtractBatch: hitting time limit, saved offset=${newOffset}, scheduling next batch.`);
+      scheduleNextBatchIfNeeded();
+      // optionally persist any partial results now (see below)
+      try { persistCollectedLinks(allLinks); } catch (e) { Logger.log('persist error: ' + e); }
+      flushDebugLog();
+      return;
+    }
+
+    const thread = threads[i];
+    let threadHasLinks = false;
+
+    // scan messages in thread
+    const messages = thread.getMessages();
+    for (let m = 0; m < messages.length; m++) {
+      const body = messages[m].getBody ? messages[m].getBody() : '';
+      const found = extractLinks(body);
+      if (found && found.length) {
+        threadHasLinks = true;
+        for (const it of found) {
+          const key = `${it.source}-${it.id || it.link}`;
+          if (!allLinks.has(key)) allLinks.set(key, { source: it.source, id: it.id, link: it.link });
+        }
+      }
+    }
+
+    // label the thread only if we extracted links from it
+    if (threadHasLinks) {
+      try {
+        thread.addLabel(processedLabel);
+        thread.removeLabel(sourceLabel);
+      } catch (e) {
+        Logger.log('Label operation failed for thread id=' + thread.getId() + ' : ' + e);
+      }
+    }
+  }
+
+  // completed this batch successfully
+  const newOffset = offset + threads.length;
+  props.setProperty(BATCH_OFFSET_PROP, String(newOffset));
+  Logger.log(`runExtractBatch: processed ${threads.length} threads. newOffset=${newOffset}`);
+
+  // persist collected links and run your existing merge/post-process routine
+  try {
+    persistCollectedLinks(allLinks);
+    // optionally run post-process now to merge new RESOLVED entries
+    // If you have heavy postProcessMainFile() that can itself take time,
+    // consider deferring it to its own scheduled job. Here we call it but tolerate failure.
+    try { postProcessMainFile(); } catch (e) { Logger.log('postProcessMainFile failed: ' + e); }
+  } catch (e) {
+    Logger.log('Error persisting links: ' + e);
+  }
+
+  // check if there are more threads remaining
+  const stillMore = sourceLabel.getThreads(newOffset, 1);
+  if (stillMore && stillMore.length > 0) {
+    Logger.log('runExtractBatch: more threads remain, scheduling next batch.');
+    scheduleNextBatchIfNeeded();
+  } else {
+    Logger.log('runExtractBatch: no more threads. Clearing state and triggers.');
+    clearBatchStateAndTriggers();
+  }
+
+  flushDebugLog();
+}
+
+// === DRIVE HELPERS ===
+function getOrCreateDriveFile(name) {
+  const files = DriveApp.getFilesByName(name);
+  return files.hasNext() ? files.next() : DriveApp.createFile(name, '');
+}
+
+// Schedule-safe single-run guard: avoid creating duplicate triggers.
+// When scheduling, we create an every-minute trigger and clear it when finished.
+// This is conservative but robust in Apps Script environments.
+function scheduleNextBatchIfNeeded() {
+  // avoid duplicates
+  const existing = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === BATCH_TRIGGER_HANDLER);
+  if (!existing) {
+    // create a 1-minute recurring trigger - we'll delete it when job completes.
+    ScriptApp.newTrigger(BATCH_TRIGGER_HANDLER).timeBased().everyMinutes(1).create();
+    Logger.log('Scheduled batch trigger for ' + BATCH_TRIGGER_HANDLER);
+  } else {
+    Logger.log('Batch trigger already exists; not creating duplicate.');
+  }
+}
+
+function clearBatchStateAndTriggers() {
+  // clear offset
+  PropertiesService.getScriptProperties().deleteProperty(BATCH_OFFSET_PROP);
+  // remove project triggers that run our handler
+  const triggers = ScriptApp.getProjectTriggers();
+  for (const t of triggers) {
+    if (t.getHandlerFunction() === BATCH_TRIGGER_HANDLER) {
+      ScriptApp.deleteTrigger(t);
+      Logger.log('Deleted trigger for ' + BATCH_TRIGGER_HANDLER);
+    }
+  }
+}
+
+function persistCollectedLinks(allLinksMap) {
+  if (!allLinksMap || allLinksMap.size === 0) return;
+
+  const mainFile = getOrCreateDriveFile(DRIVE_FILENAME_MAIN);
+  const existing = (function(){
+    try { return mainFile.getBlob().getDataAsString(); } catch(e){ return ''; }
+  })();
+
+  // Build lines to append in canonical "SRC | id | link" format for non-forum entries and raw lines for others.
+  const toAppendLines = [];
+  for (const entry of allLinksMap.values()) {
+    if (!entry || !entry.source) continue;
+    if (['SV','SB','QQ'].includes(entry.source)) {
+      // For forum posts, append raw link as a new line (kept for postProcessMainFile to handle)
+      toAppendLines.push(entry.link);
+    } else {
+      // e.g. 'FF | 12345 | https://...'
+      toAppendLines.push(`${entry.source} | ${entry.id || ''} | ${entry.link}`);
+    }
+  }
+  if (toAppendLines.length === 0) return;
+
+  const newContent = (existing ? (existing + '\n') : '') + toAppendLines.join('\n') + '\n';
+  mainFile.setContent(newContent);
+  Logger.log('persistCollectedLinks: appended ' + toAppendLines.length + ' lines to ' + DRIVE_FILENAME_MAIN);
+
+  // Update sv file too for convenience (append forum links)
+  const forumLines = toAppendLines.filter(l => l.indexOf('http') === 0 && (l.indexOf('forums.') !== -1 || l.indexOf('forum.') !== -1));
+  if (forumLines.length) {
+    const svFile = getOrCreateDriveFile(DRIVE_FILENAME_SVSBQQ);
+    let existingSV = '';
+    try { existingSV = svFile.getBlob().getDataAsString(); } catch(e){ existingSV = ''; }
+    const appended = (existingSV ? (existingSV + '\n') : '') + forumLines.join('\n') + '\n';
+    svFile.setContent(appended);
+    Logger.log('persistCollectedLinks: appended ' + forumLines.length + ' forum lines to ' + DRIVE_FILENAME_SVSBQQ);
+  }
+}
+
+// === WEB APP ENDPOINTS ===
+// NOTE: this project must include your auth.gs (verifyToken/extractIncomingToken/getExpectedToken).
+
+/**
+ * Protected GET: returns the SV_SB_QQ_links.txt (plain text). Requires token.
+ * The token may be supplied as:
+ *  - Authorization: Bearer <token> (preferred),
+ *  - JSON body { "token": "..." } (for POST only; included for completeness),
+ *  - or ?token=<token> query param.
+ */
+function doGet(e) {
+   try {
+    // verify token
+     if (typeof verifyToken === 'function') {
+       if (!verifyToken(e)) {
+         return ContentService.createTextOutput('Unauthorized').setMimeType(ContentService.MimeType.TEXT);
+       }
+     } else {
+       return ContentService.createTextOutput('Unauthorized').setMimeType(ContentService.MimeType.TEXT);
+     }
+
+     // Return the SV/SB/QQ file content (create empty if missing)
+     const ITER = DriveApp.getFilesByName(DRIVE_FILENAME_SVSBQQ);
+     if (!ITER.hasNext()) {
+       return ContentService.createTextOutput('').setMimeType(ContentService.MimeType.TEXT);
+     }
+
+     const content = ITER.next().getBlob().getDataAsString();
+     return ContentService.createTextOutput(content).setMimeType(ContentService.MimeType.TEXT);
+  
+     } finally {
+       flushDebugLog(); // <-- flush once here
+     }
+}
+
+/**
+ * Protected POST: accepts JSON body {"resolved": ["url1","url2", ...]} and appends to main file.
+ * Requires token (same extraction logic as doGet).
+ */
+/**
+ * Unified doPost that handles:
+ *  - {"action":"run"}      -> triggers extractAndStoreFanficLinks()
+ *  - {"action":"clear"}    -> clears the main and SV/SB/QQ Drive files (empties content)
+ *  - {"resolved":[...]}    -> appends resolved URLs to DRIVE_FILENAME_MAIN (existing behaviour)
+ *
+ * Token is required and verified by verifyToken(e) from auth.gs.
+ */
+function doPost(e) {
+  try {
+    // token check
+    if (typeof verifyToken === 'function') {
+      if (!verifyToken(e)) {
+        return ContentService.createTextOutput('Unauthorized').setMimeType(ContentService.MimeType.TEXT);
+      }
+    } else {
+      return ContentService.createTextOutput('Unauthorized').setMimeType(ContentService.MimeType.TEXT);
+    }
+
+    // parse JSON body if present
+    let body = null;
+    if (e && e.postData && e.postData.contents) {
+      try { body = JSON.parse(e.postData.contents); } catch (err) { body = null; }
+    }
+
+    const actionParam = (e && e.parameter && e.parameter.action) ? String(e.parameter.action).toLowerCase() : null;
+    const action = (body && body.action) ? String(body.action).toLowerCase() : (actionParam || null);
+
+    if (action === 'run') {
+      try {
+        // schedule the batch runner and return immediately (avoid webapp timeout)
+        scheduleNextBatchIfNeeded();
+        return ContentService.createTextOutput('OK: scheduled extractor run (batch mode).').setMimeType(ContentService.MimeType.TEXT);
+      } catch (err) {
+        Logger.log('doPost(schedule run) error: ' + (err && err.stack ? err.stack : err));
+        return ContentService.createTextOutput('Error scheduling extractor run: ' + err.message).setMimeType(ContentService.MimeType.TEXT);
+      }
+    }
+    if (action === 'clear') {
+      try {
+        const mainIter = DriveApp.getFilesByName(DRIVE_FILENAME_MAIN);
+        if (!mainIter.hasNext()) DriveApp.createFile(DRIVE_FILENAME_MAIN, '');
+        else mainIter.next().setContent('');
+        const svIter = DriveApp.getFilesByName(DRIVE_FILENAME_SVSBQQ);
+        if (!svIter.hasNext()) DriveApp.createFile(DRIVE_FILENAME_SVSBQQ, '');
+        else svIter.next().setContent('');
+        return ContentService.createTextOutput('OK: Cleared Drive files.').setMimeType(ContentService.MimeType.TEXT);
+      } catch (err) {
+        Logger.log('doPost(clear) error: ' + (err && err.stack ? err.stack : err));
+        return ContentService.createTextOutput('Error clearing Drive files: ' + err.message).setMimeType(ContentService.MimeType.TEXT);
+      }
+    }
+
+    if (body && Array.isArray(body.resolved)) {
+     try {
+       const mainIter = DriveApp.getFilesByName(DRIVE_FILENAME_MAIN);
+       const file = mainIter.hasNext() ? mainIter.next() : DriveApp.createFile(DRIVE_FILENAME_MAIN, '');
+       const existing = file.getBlob().getDataAsString();
+       const footer = body.resolved.map(u => `RESOLVED | ${u}`).join('\n');
+       file.setContent((existing ? (existing + '\n') : '') + footer);
+
+       // Log before calling
+       Logger.log(`doPost: About to call postProcessMainFile() after appending ${body.resolved.length} lines`);
+       // call and capture explicit result or exception
+       let postResult;
+       try {
+         postResult = postProcessMainFile();
+         Logger.log('doPost: postProcessMainFile() returned: ' + String(postResult));
+       } catch (innerErr) {
+         // If postProcess throws, log it and include in response
+         Logger.log('doPost: postProcessMainFile threw: ' + (innerErr && innerErr.stack ? innerErr.stack : innerErr));
+         return ContentService
+           .createTextOutput(`Appended ${body.resolved.length} | postProcessMainFile: THROW`)
+           .setMimeType(ContentService.MimeType.TEXT);
+       }
+
+       // Return the post-process result explicitly to the client (helps the extension)
+       return ContentService
+         .createTextOutput(`Appended ${body.resolved.length} | postProcessMainFile: ${String(postResult)}`)
+         .setMimeType(ContentService.MimeType.TEXT);
+
+     } catch (err) {
+       Logger.log('doPost(resolved) error: ' + (err && err.stack ? err.stack : err));
+       return ContentService.createTextOutput('Error handling resolved URLs: ' + err.message).setMimeType(ContentService.MimeType.TEXT);
+     }
+   }
+
+    return ContentService.createTextOutput('Bad payload — expected {"action":"run"|"clear"} or {"resolved":[...]}').setMimeType(ContentService.MimeType.TEXT);
+
+  } catch (err) {
+    Logger.log('doPost top-level error: ' + (err && err.stack ? err.stack : err));
+    return ContentService.createTextOutput('Internal error: ' + err.message).setMimeType(ContentService.MimeType.TEXT);
+  } finally {
+    flushDebugLog(); // <-- flush once here
+  }
+}

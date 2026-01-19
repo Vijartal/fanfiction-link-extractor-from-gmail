@@ -1,0 +1,65 @@
+/**
+ * auth.gs
+ *
+ * Add this file to the same Apps Script project as your main file.
+ * Run setSharedToken() once from the editor OR set the property in Project Settings.
+ *
+ * IMPORTANT: After running setSharedToken() remove or comment out the function
+ * so the secret is not left in code.
+ */
+
+// Run once (from editor) to set the shared token, or use Project Settings -> Script properties.
+function setSharedToken() {
+  const TOKEN = 'paste-your-generated-token-here'; // <-- REPLACE with your token (no spaces)
+  PropertiesService.getScriptProperties().setProperty('SHARED_TOKEN', TOKEN);
+}
+
+// Return server-side expected token (empty string if not set)
+function getExpectedToken() {
+  return PropertiesService.getScriptProperties().getProperty('SHARED_TOKEN') || '';
+}
+
+/**
+ * Extract incoming token from the request.
+ * Prefer Authorization header (Bearer), fallback to JSON body field `token`, then fallback to e.parameter.token.
+ */
+function extractIncomingToken(e) {
+  try {
+    // 1) headers (Authorization: Bearer <token>)
+    if (e && e.headers) {
+      const auth = e.headers['Authorization'] || e.headers['authorization'];
+      if (auth && typeof auth === 'string' && auth.toLowerCase().startsWith('bearer ')) {
+        return auth.slice(7).trim();
+      }
+    }
+  } catch (err) {
+    // ignore and fallback
+  }
+
+  // 2) JSON body token
+  try {
+    if (e && e.postData && e.postData.contents) {
+      const body = JSON.parse(e.postData.contents);
+      if (body && body.token) return String(body.token).trim();
+    }
+  } catch (err) {
+    // ignore
+  }
+
+  // 3) form/query param
+  try {
+    if (e && e.parameter && e.parameter.token) return String(e.parameter.token).trim();
+  } catch (err) {}
+
+  return '';
+}
+
+/**
+ * Verify token; returns true if verified, false otherwise.
+ */
+function verifyToken(e) {
+  const expected = getExpectedToken();
+  if (!expected) return false;
+  const incoming = extractIncomingToken(e);
+  return incoming === expected;
+}
